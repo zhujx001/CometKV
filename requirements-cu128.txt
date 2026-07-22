@@ -1,0 +1,10 @@
+# CUDA 12.8 binary stack for the cometkv conda environment.
+# Keep FlashAttention as a direct release wheel URL; the PyPI source package
+# falls back to local nvcc compilation for this stack.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.8.0+cu128
+flashinfer-python==0.6.12
+flashinfer-cubin==0.6.12
+https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.12/flashinfer_jit_cache-0.6.12%2Bcu128-cp39-abi3-manylinux_2_28_x86_64.whl
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl

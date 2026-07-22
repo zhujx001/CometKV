@@ -1,0 +1,21 @@
+{
+    "llama": 130000,
+    "llama-3.1": 130000,
+    "llama-3.1-8b": 130000,
+    "llama-3.1-8b-instruct": 130000,
+    "llama3.1-8b-instruct": 130000,
+    "Meta-Llama-3.1-8B-Instruct": 130000,
+    "llama-3-8b-1048k": 130000,
+    "qwen": 32768,
+    "qwen2.5": 32768,
+    "qwen2.5-7b": 32768,
+    "qwen2.5-7b-instruct": 32768,
+    "qwen-2.5-7b-instruct": 32768,
+    "Qwen2.5-7B-Instruct": 32768,
+    "qwen2.5-72b": 32768,
+    "mistral": 32768,
+    "mistral-v0.2": 32768,
+    "mistral-7b-instruct-v0.2": 32768,
+    "Mistral-7B-Instruct-v0.2": 32768,
+    "mistral-7b-Instruct-32k": 32768
+}

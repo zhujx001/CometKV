@@ -1,0 +1,33 @@
+# Core runtime and build helpers.
+numpy==2.2.6
+tqdm==4.67.3
+ninja==1.11.1.4
+termcolor==3.3.0
+packaging==25.0
+pybind11==2.12.0
+
+# Model loading.
+transformers==5.10.2
+huggingface-hub==1.17.0
+
+# Dataset and benchmark plumbing.
+datasets==3.6.0
+evaluate==0.4.3
+rouge==1.0.1
+rouge_score==0.1.2
+scipy==1.13.0
+PyYAML==6.0.3
+nltk==3.9.4
+pandas==2.3.3
+jieba==0.42.1
+fuzzywuzzy==0.18.0
+
+# RULER data generation and utilities.
+wonderwords==2.2.0
+html2text==2024.2.26
+bs4==0.0.2
+beautifulsoup4==4.14.3
+fire==0.7.0
+
+# Local validation.
+pytest==9.0.3

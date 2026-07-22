@@ -1,0 +1,14 @@
+{
+    "CometKV": {
+        "static_pattern_start": 4,
+        "static_pattern_end": 32,
+        "core": 22,
+        "retrieval_budget": 0.02,
+        "sig_bits": 128,
+        "sig_seed": 1234,
+        "sig_mode": "random_orth",
+        "sig_topk": 0,
+        "sig_chunk_size": 131072,
+        "sig_token_cache_size": 1024
+    }
+}

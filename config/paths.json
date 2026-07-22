@@ -1,0 +1,82 @@
+{
+    "models": {
+        "llama-3-8b-1048k": {
+            "path": "gradientai/Llama-3-8B-Instruct-Gradient-1048k",
+            "aliases": [
+                "Llama-3-8B-Instruct-Gradient-1048k"
+            ],
+            "template_type": "meta-chat",
+            "framework": "hf",
+            "tokenizer_type": "hf"
+        },
+        "llama-3.1-8b": {
+            "path": "meta-llama/Llama-3.1-8B-Instruct",
+            "aliases": [
+                "Llama-3.1-8B-Instruct",
+                "meta-llama/Llama-3.1-8B-Instruct"
+            ],
+            "template_type": "meta-chat",
+            "framework": "hf",
+            "tokenizer_type": "hf"
+        },
+        "qwen2.5-7b": {
+            "path": "Qwen/Qwen2.5-7B-Instruct",
+            "aliases": [
+                "Qwen2.5-7B-Instruct",
+                "Qwen/Qwen2.5-7B-Instruct"
+            ],
+            "template_type": "meta-chat",
+            "framework": "hf",
+            "tokenizer_type": "hf"
+        },
+        "mistral-7b-instruct-v0.2": {
+            "path": "mistralai/Mistral-7B-Instruct-v0.2",
+            "aliases": [
+                "Mistral-7B-Instruct-v0.2"
+            ],
+            "template_type": "meta-chat",
+            "framework": "hf",
+            "tokenizer_type": "hf"
+        },
+        "deepseek-r1-distill-llama-8b": {
+            "path": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+            "aliases": [
+                "DeepSeek-R1-Distill-Llama-8B"
+            ],
+            "template_type": "meta-chat",
+            "framework": "hf",
+            "tokenizer_type": "hf"
+        },
+        "deepseek-r1-distill-qwen-7b": {
+            "path": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+            "aliases": [
+                "DeepSeek-R1-Distill-Qwen-7B"
+            ],
+            "template_type": "meta-chat",
+            "framework": "hf",
+            "tokenizer_type": "hf"
+        }
+    },
+    "datasets": {
+        "longbench": {
+            "data_dir": "data/longbench-jsonl"
+        },
+        "ruler": {
+            "cache_dir": "data/ruler_dataset_cache"
+        },
+        "throughput": {
+            "test_data_dir": "throughput_eval/test_data"
+        },
+        "simple_test": {
+            "data_path": "simple_test_data.json"
+        }
+    },
+    "runtime": {
+        "conda_roots": [
+            "${HOME}/miniconda3",
+            "${HOME}/anaconda3",
+            "/opt/miniconda3",
+            "/opt/anaconda3"
+        ]
+    }
+}

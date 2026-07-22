@@ -1,0 +1,45 @@
+# Python caches and packaging artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Native-extension and package builds
+build/
+dist/
+*.o
+*.a
+.ninja_deps
+.ninja_log
+
+# Optional local dependency checkouts and model caches
+.huggingface/
+library/cutlass/
+library/Block-Sparse-Attention/
+
+# Benchmark outputs
+result/
+results/
+benchmark/longbench/bench_logs/
+benchmark/ruler/data/synthetic/json/*.json
+benchmark/ruler/ruler_dataset_cache/
+benchmark/ruler/ruler_eval_result/
+benchmark/ruler/ruler_eval_result*/
+benchmark/ruler/speed_results/
+throughput_eval/cometkv_logs/
+
+# Local editor files
+.vscode/
+*.code-workspace
+*~
+
+# RULER source corpora fetched by scripts/prepare_data.sh
+benchmark/ruler/data/synthetic/json/PaulGrahamEssays.json
+benchmark/ruler/data/synthetic/json/squad.json
+benchmark/ruler/data/synthetic/json/hotpotqa.json
+benchmark/ruler/data/synthetic/json/essay_repo/
+benchmark/ruler/data/synthetic/json/essay_html/
+local_env.sh
+/data
