@@ -16,6 +16,7 @@ from cometkv import (
     append_lockstep_local_kv_cache_and_advance,
     append_lockstep_local_kv_cache_dev,
     asym_signature_score_into,
+    grouped_signature_score_into,
     concat_static_recent_gpu_gather,
     concat_static_recent_gpu_gather_int8,
     concat_static_recent_lookup_gather_uva_kv_update_cache,
@@ -26,6 +27,7 @@ from cometkv import (
     sampled_tail_attention_merge,
     uva_gather_kv_rows,
     uva_gather_kv_rows_window,
+    exact_topk_indices_into,
 )
 try:
     from flash_attn import flash_attn_with_kvcache
@@ -80,6 +82,10 @@ class cometkv_cache(KV_Cache):
         sample_frac: float = 0.0,
         sample_tau: float = 1.0,
         sample_seed: int = 1234,
+        stats_mode: str = "block",
+        query_aggregation: str = "mean_prob",
+        sample_size: int | None = None,
+        sig_max_retrieval_topk: int = 0,
     ) -> None:
         super().__init__(
             layer_num,
@@ -111,6 +117,9 @@ class cometkv_cache(KV_Cache):
         self.sig_mode = sig_mode
         self.base_sig_token_cache_size = int(sig_token_cache_size)
         self.sig_min_retrieval_topk = max(int(sig_min_retrieval_topk), 0)
+        self.sig_max_retrieval_topk = int(os.environ.get("COMETKV_MAX_RETRIEVAL_TOPK", sig_max_retrieval_topk))
+        if self.sig_max_retrieval_topk < 0:
+            raise ValueError("sig_max_retrieval_topk must be nonnegative (0 = no explicit cap)")
         self.exclude_preserved_from_budget = bool(exclude_preserved_from_budget)
         # Retrieval selector: 120 sign bits + 1 byte log-quantized ||k|| (16B/token), scored
         # asymmetrically with a float query projection and norm weighting.
@@ -134,69 +143,83 @@ class cometkv_cache(KV_Cache):
         self.kv_store_device = str(kv_store_device or "cpu").lower()
         assert self.kv_store_device in ("cpu", "gpu"), f"Unsupported kv_store_device: {self.kv_store_device}"
         self.kv_on_gpu = self.kv_store_device == "gpu"
-        # Mean update: on each decode-token eviction, blend the frozen prompt mean μ toward the
-        # evicted batch mean with EMA: μ ← (1-α)μ + α·mean(k_evicted). α=0 disables (frozen, A/B
-        # baseline). Only affects FUTURE evicted-token signature building (old signatures keep
-        # their centering). Runs on the eviction path (every 128 decode tokens) — zero per-token
-        # decode overhead. Ranking equivalence holds within each centering regime (q·μ is constant
-        # across candidates sharing the same μ); cross-regime distortion is second-order and
-        # dominated by the sign-bit decorrelation gain.
+        self.stats_mode = os.environ.get("COMETKV_STATS_MODE", stats_mode).lower()
+        self.query_aggregation = os.environ.get("COMETKV_QUERY_AGG", query_aggregation).lower()
+        if self.stats_mode not in ("block", "frozen"):
+            raise ValueError("stats_mode must be 'block' or 'frozen'")
+        if self.query_aggregation not in ("mean_prob", "q_sum"):
+            raise ValueError("query_aggregation must be 'mean_prob' or 'q_sum'")
+        self.block_stats = self.stats_mode == "block"
+        # Auto uses FP32 lookup scoring for block/q_sum and exact radix selection
+        # for long, sparse ranges. Explicit switches support controlled comparisons.
+        self.signature_score_impl = os.environ.get("COMETKV_SCORE_IMPL", "auto").lower()
+        self.exact_topk_impl = os.environ.get("COMETKV_TOPK_IMPL", "auto").lower()
+        if self.signature_score_impl not in ("auto", "scalar", "lookup"):
+            raise ValueError("COMETKV_SCORE_IMPL must be auto, scalar or lookup")
+        if self.exact_topk_impl not in ("auto", "torch", "radix"):
+            raise ValueError("COMETKV_TOPK_IMPL must be auto, torch or radix")
+        self._exact_topk_workspace = {}
+        # Forward-only EMA omitted a first-order, query-dependent offset between
+        # signatures encoded with different centers. Use sealed block statistics.
         self.mean_update_alpha = float(mean_update_alpha)
-        # Norm range margin: widen the frozen log-norm quantization range [lo, hi] by this fraction
-        # at prefill so decode-evicted tokens (whose norms systematically exceed prompt norms) are
-        # less likely to saturate to code 255. 0.0 = exact prompt range (current behavior).
+        if self.mean_update_alpha != 0.0:
+            raise ValueError("Forward-only mean_update_alpha is unsupported; use stats_mode='block'.")
+        # Widen each newly sealed block's log-norm range by this fraction on each side.
+        # Frozen mode applies this only at prefill; block mode also updates new blocks.
         self.norm_margin = float(norm_margin)
         # Full recompute interval: every N decode tokens, recompute μ and norm range from ALL keys
         # in the retrieval index and rebuild ALL signatures. 0 = disabled. Runs on the eviction path.
         self.full_recompute_interval = int(full_recompute_interval)
-        self._recompute_decode_counter = 0
+        if self.full_recompute_interval < 0 or self.norm_margin < 0:
+            raise ValueError("full_recompute_interval and norm_margin must be nonnegative")
+        if self.block_stats and self.full_recompute_interval:
+            raise ValueError("Full recompute requires stats_mode='frozen'; block statistics are immutable.")
+        self._recompute_decode_counter = [0] * self.layer_num
         self.last_full_recompute_ms = 0.0
-        # Sampled-tail hybrid estimator (0.0 = pure top-k, legacy-identical). The retrieval budget
-        # k splits into an exact top-(k-m) head plus m = round(frac*k) tail tokens sampled WITH
-        # replacement from proposal softmax(score * beta), beta = 1/(group*sqrt(d)*tau); each
-        # sampled slot's attention logit gets -log(m * q_j), making head+tail a self-normalized
-        # importance-sampling estimate of FULL attention over the candidates instead of the
-        # truncate-and-renormalize top-k estimate. Gather volume is unchanged (kh + m == k).
-        # Environment values override config values, like the other runtime knobs.
+        # Tail draws are ADDITIONAL to the deterministic head budget. Fixed sample_size
+        # takes precedence; legacy sample_frac derives an additional count from head k.
+        # An explicit FRAC environment override still works for older launch scripts.
+        if "COMETKV_SAMPLE_SIZE" in os.environ:
+            sample_size = int(os.environ["COMETKV_SAMPLE_SIZE"])
+        elif "COMETKV_SAMPLE_FRAC" in os.environ:
+            sample_size = None
+        self.sample_size = None if sample_size is None else int(sample_size)
+        if self.sample_size is not None and self.sample_size < 0:
+            raise ValueError("sample_size must be nonnegative (0 disables sampling)")
         self.sample_frac = float(os.environ.get("COMETKV_SAMPLE_FRAC", sample_frac))
         self.sample_tau = float(os.environ.get("COMETKV_SAMPLE_TAU", sample_tau))
         self.sample_seed = int(os.environ.get("COMETKV_SAMPLE_SEED", sample_seed))
         assert 0.0 <= self.sample_frac < 1.0, "sample_frac must be in [0, 1)"
         assert self.sample_tau > 0.0, "sample_tau must be positive"
-        if self.sample_frac > 0.0:
-            # asym_n8 scores live in projection space with an unknown scale, so their proposal
-            # is auto-standardized instead (see sample_autoscale below).
+        if self.sample_frac > 0.0 or (self.sample_size or 0) > 0:
+            # Both score variants support the tail proposal: calibrated log probabilities
+            # for mean_prob, auto-standardized projection scores for legacy q_sum.
             assert self.selector_mode in ("asym_n8",), (
                 f"sampled-tail estimator unsupported for selector {self.selector_mode}"
             )
         # Proposal auto-standardization: z-score the candidate scores and rescale to a target
         # logit std (sigma/tau) instead of the analytic 1/(G*sqrt(d)) beta. Env overrides for A/B.
-        _auto_default = "1"
+        _auto_default = "0" if self.query_aggregation == "mean_prob" else "1"
         self.sample_autoscale = os.environ.get("COMETKV_SAMPLE_AUTOSCALE", _auto_default) == "1"
         self.sample_sigma = float(os.environ.get("COMETKV_SAMPLE_SIGMA", "2.0"))
+        # A uniform component prevents zero support from fp32 softmax underflow and
+        # covers owner-head positions needed by subsequent layers with different heads.
+        self.sample_uniform_mix = float(os.environ.get("COMETKV_SAMPLE_UNIFORM_MIX", "0.1"))
+        if not 0.0 < self.sample_uniform_mix <= 1.0:
+            raise ValueError("COMETKV_SAMPLE_UNIFORM_MIX must be in (0, 1]")
         # Truncated-IS clip (environment override): cap each corrected tail logit at
-        # per-(row,head) mean + clip nats (applied inside the fused tail kernel). Tames the
-        # heavy-tailed importance weights caused by proposal mismatch (code error + per-head
-        # deviation from the grouped-sum proposal, each worth a few nats) at the cost of a
-        # small estimator bias. Default 4.0 = the paper final config (joint mean-clip beat
-        # logit-median and corr-only variants 96.0/94.67/89.33 on fwe-32k); 0 = off.
+        # per-(row,head) valid-slot mean + clip nats (inside the fused kernel). This
+        # controls large importance weights at the cost of bias; 0 disables clipping.
         self.sample_clip = float(os.environ.get("COMETKV_SAMPLE_CLIP", "4.0"))
         # Resample stride (env-only): draws/corr are recomputed from the CURRENT layer's scores
-        # every J-th layer and reused in between. J=1 = fresh proposal per layer (highest
-        # accuracy, full sampling cost per layer); large J = layer-0-shared (cheapest, deep
-        # layers pay proposal-staleness variance: fwe-32k@2% 97.33 at J=1 vs 92.0 shared;
-        # J=8 with kernel mean-clip: 96.0).
+        # every J-th layer and reused in between. All layers share a full-support proposal;
+        # the merge kernel removes each current layer's head from its tail contributions.
         self.sample_stride = max(1, int(os.environ.get("COMETKV_SAMPLE_STRIDE", "8")))
-        # Hard cap on m: the sampled tail is ALWAYS-miss PCIe traffic (layers x rows x m x 512B
-        # per step — 70MB/step at 119k with frac=0.25 uncapped), so m is capped independently of
-        # the frac split. 160 keeps the per-window batched transfer under one layer's compute
-        # time (hidable on the side stream) while the clip keeps the estimator variance tame.
-        self.sample_max_m = max(1, int(os.environ.get("COMETKV_SAMPLE_MAX_M", "160")))
-        # Minimum useful m: below this the tail estimate is pure 1/m variance with no bias
-        # to fix (short contexts: at 4k ctx k~82 -> m~20 draws over a tail whose mass top-k
-        # already covers). LongBench by-length A/B located the sampled-arm regressions
-        # exactly in the 0-8k buckets (lcc/repobench-p/samsum) while 8k+ gained — the guard
-        # auto-disables sampling there and leaves every long-context win untouched.
+        # Hard cap on raw draws. The BF16 CPU path bypasses the token cache, so each
+        # additional slot reads KV across all layers regardless of head cache hit rate.
+        self.sample_max_m = max(1, int(os.environ.get("COMETKV_SAMPLE_MAX_M", "256")))
+        # Legacy fraction-derived counts retain their minimum-size guard. Explicit sizes
+        # (including 32) bypass this heuristic, but still respect the hard maximum above.
         self.sample_min_m = max(0, int(os.environ.get("COMETKV_SAMPLE_MIN_M", "64")))
         self._sample_chunk = 512   # two-level inverse-CDF sampling chunk width
         self.active_sample_len_host = 0
@@ -226,6 +249,17 @@ class cometkv_cache(KV_Cache):
         # here because sig_token_cache_size itself may later grow to ~4x topk for temporal reuse
         # (_refresh_token_cache_sizes_for_temporal_reuse) and must not inflate concat storage.
         self.concat_sparse_capacity_bound = self.sig_token_cache_size
+        self.sig_block_capacity = (
+            2 + math.ceil((max(self.max_new_length, 0) + self.lockstep_recent_overlap)
+                          / self.lockstep_decode_block_size)
+            if self.block_stats else 1
+        )
+        self.sig_active_blocks = [1] * self.layer_num
+        # E[||x|| (Pq).sign(Px)] = c * q.x for orthogonal unit rows P.
+        self.signature_score_scale = self.asym_sig_bits * math.exp(
+            math.lgamma(self.head_dim / 2.0) - 0.5 * math.log(math.pi)
+            - math.lgamma((self.head_dim + 1.0) / 2.0)
+        )
 
         self.batch_indices_dict = {}
         for device_idx in self.device_list:
@@ -283,6 +317,20 @@ class cometkv_cache(KV_Cache):
             for ldx in range(self.layer_num)
         ]
         self._asym_scores_buffers = {}
+        self._grouped_score_buffers = {}
+        # Block 0 is the prompt. Centers are stored relative to its center so
+        # the prompt needs no compensation and logits have a common origin.
+        self.sig_block_centers = [
+            torch.zeros((self.batch_groups, self.sig_block_capacity, self.head_dim),
+                        dtype=torch.float32, device=self.layer_mapping[str(ldx)])
+            for ldx in range(self.layer_num)
+        ]
+        self.sig_block_norm_lo = [
+            torch.zeros((self.batch_groups, self.sig_block_capacity),
+                        dtype=torch.float32, device=self.layer_mapping[str(ldx)])
+            for ldx in range(self.layer_num)
+        ]
+        self.sig_block_norm_step = [torch.ones_like(lo) for lo in self.sig_block_norm_lo]
         if self.selector_mode == "asym_n8":
             self.sig_norm_lo = [
                 torch.zeros((self.batch_groups,), dtype=torch.float32, device=self.layer_mapping[str(ldx)])
@@ -546,25 +594,35 @@ class cometkv_cache(KV_Cache):
         return packed.contiguous()
 
     def _build_prefill_signatures(self, key_vectors: torch.Tensor, layer_idx: int,
-                                  row_start: int = 0, freeze_norm_scale: bool = True):
+                                  row_start: int = 0, freeze_norm_scale: bool = True,
+                                  block_idx: int = 0):
         projection_t = self._projection_t_for(self.layer_mapping[str(layer_idx)])
         rows, valid_length, _ = key_vectors.shape
+        row_end = row_start + rows
+        new_block = self.block_stats and block_idx > 0
+        if not 0 <= block_idx < self.sig_block_capacity:
+            raise ValueError("Signature block exceeds preallocated capacity")
         packed = torch.empty((rows, valid_length, self.sig_bytes), dtype=torch.uint8, device=key_vectors.device)
         pack_n8 = self.selector_mode == "asym_n8"
         if pack_n8:
             norms = torch.empty((rows, valid_length), dtype=torch.float32, device=key_vectors.device)
         mu = None
         if self.center_keys:
-            row_end = row_start + rows
             mu_slice = self.sig_key_mean[layer_idx][row_start:row_end]
-            if freeze_norm_scale:
+            if new_block:
+                mu = key_vectors.float().mean(dim=1, keepdim=True)
+                self.sig_block_centers[layer_idx][row_start:row_end, block_idx].copy_(
+                    mu.squeeze(1) - mu_slice
+                )
+            elif freeze_norm_scale:
                 # Freeze the per-row key mean from the prompt (chunked to bound the fp32 transient).
                 accum = torch.zeros((rows, self.head_dim), dtype=torch.float32, device=key_vectors.device)
                 for chunk_start in range(0, valid_length, self.prefill_signature_chunk_size):
                     chunk_end = min(valid_length, chunk_start + self.prefill_signature_chunk_size)
                     accum += key_vectors[:, chunk_start:chunk_end, :].float().sum(dim=1)
                 mu_slice.copy_(accum / max(valid_length, 1))
-            mu = mu_slice.unsqueeze(1)
+            if mu is None:
+                mu = mu_slice.unsqueeze(1)
         for chunk_start in range(0, valid_length, self.prefill_signature_chunk_size):
             chunk_end = min(valid_length, chunk_start + self.prefill_signature_chunk_size)
             # Keep the prefill fast path numerically aligned with the decode-time signature kernel.
@@ -579,13 +637,14 @@ class cometkv_cache(KV_Cache):
                 norms[:, chunk_start:chunk_end] = chunk.norm(dim=-1)
             packed[:, chunk_start:chunk_end, :].copy_(self._pack_signature_bits(bits))
         if pack_n8:
-            row_end = row_start + rows
-            lo = self.sig_norm_lo[layer_idx][row_start:row_end]
-            step = self.sig_norm_step[layer_idx][row_start:row_end]
+            lo = (self.sig_block_norm_lo[layer_idx][row_start:row_end, block_idx]
+                  if new_block else self.sig_norm_lo[layer_idx][row_start:row_end])
+            step = (self.sig_block_norm_step[layer_idx][row_start:row_end, block_idx]
+                    if new_block else self.sig_norm_step[layer_idx][row_start:row_end])
             log_norms = norms.clamp_min(1e-6).log()
-            if freeze_norm_scale:
-                # Freeze the per-row dequant scale from the prompt (decode-evicted tokens reuse it).
-                # Optionally widen the range by norm_margin on each side to reduce decode saturation.
+            if freeze_norm_scale or new_block:
+                # Each sealed block retains its own scale; frozen mode reuses the prompt scale.
+                # Optional margin widens the range on each side before quantization.
                 lo_vals = log_norms.min(dim=1).values
                 hi_vals = log_norms.max(dim=1).values
                 if self.norm_margin > 0:
@@ -596,6 +655,9 @@ class cometkv_cache(KV_Cache):
                 step.copy_(((hi_vals - lo_vals) / 255.0).clamp_min(1e-8))
             code = torch.round((log_norms - lo.unsqueeze(1)) / step.unsqueeze(1)).clamp(0, 255)
             packed[..., self.sig_bytes - 1] = code.to(torch.uint8)
+            if block_idx == 0:
+                self.sig_block_norm_lo[layer_idx][row_start:row_end, 0].copy_(lo)
+                self.sig_block_norm_step[layer_idx][row_start:row_end, 0].copy_(step)
         return packed
 
     def _full_recompute_stats(self, layer_idx: int, token_end: int):
@@ -611,6 +673,8 @@ class cometkv_cache(KV_Cache):
         else:
             # CPU pinned → copy to GPU for fast GEMM. non_blocking=False to ensure data is ready.
             all_keys = self.cpu_key_cache[layer_idx][:, :token_end, :].to(device, non_blocking=False).to(torch.float32)
+        if self.quantize_cpu_kv:
+            all_keys.mul_(self.cpu_kv_k_scale[layer_idx].unsqueeze(1))
         rows, n_tokens, _ = all_keys.shape
 
         # --- recompute μ ---
@@ -1073,20 +1137,17 @@ class cometkv_cache(KV_Cache):
             self.prompt_lengths,
             torch.full_like(self.prompt_lengths, self.static_pattern_start),
         )
-        max_decode_tokens = min(
-            max(self.max_new_length - 1, 0),
-            self.static_pattern_end,
-            self._fixed_prompt_local_recent_capacity(),
-        )
-        max_visible_lengths = self.visible_lengths + max_decode_tokens
-        recent_starts = torch.maximum(
-            sink_ends,
-            max_visible_lengths - self.static_pattern_end,
-        )
+        # Allocate for the whole planned generation, not just prompt + recent tokens.
+        # Candidate/preserved counts below are conservative bounds: the growing local
+        # window always preserves at least static_pattern_end recent tokens, and can
+        # only reduce k. This covers include-preserved budgets across slides as well.
+        max_visible_lengths = self.prompt_lengths + max(self.max_new_length - 1, 0)
+        recent_starts = torch.maximum(sink_ends, max_visible_lengths - self.static_pattern_end)
         retrieval_lengths = (recent_starts - sink_ends).clamp(min=0)
-        recent_lengths = (max_visible_lengths - recent_starts).clamp(min=0)
-        preserved_lengths = sink_ends + recent_lengths
-        return int(self._compute_topk_for_lengths(retrieval_lengths, preserved_lengths, max_visible_lengths).max().item())
+        preserved_lengths = sink_ends + max_visible_lengths - recent_starts
+        return int(self._compute_topk_for_lengths(
+            retrieval_lengths, preserved_lengths, max_visible_lengths,
+        ).max().item())
 
     def _valid_lengths_from_prefill(self, seq_len: int):
         self._assert_fast_only_lockstep_supported()
@@ -1290,13 +1351,15 @@ class cometkv_cache(KV_Cache):
             # Clamp by retrieval_length: the sig_min_retrieval_topk floor must never request
             # more than the available candidates, otherwise the surplus selected slots stay -1
             # and the gather zero-fills them, diluting the softmax (no key-side mask is applied).
-            return min(max(min(self.sig_topk, retrieval_length), self.sig_min_retrieval_topk), retrieval_length)
+            k = min(max(min(self.sig_topk, retrieval_length), self.sig_min_retrieval_topk), retrieval_length)
+            return min(k, self.sig_max_retrieval_topk) if self.sig_max_retrieval_topk else k
 
         if visible_length is None:
             visible_length = retrieval_length + preserved_length
         budget_preserved_length = 0 if self.exclude_preserved_from_budget else int(preserved_length)
         sparse_budget = int(visible_length * self.retrieval_budget) - budget_preserved_length
-        return min(max(min(max(sparse_budget, 0), retrieval_length), self.sig_min_retrieval_topk), retrieval_length)
+        k = min(max(min(max(sparse_budget, 0), retrieval_length), self.sig_min_retrieval_topk), retrieval_length)
+        return min(k, self.sig_max_retrieval_topk) if self.sig_max_retrieval_topk else k
 
     def _compute_topk_for_lengths(self, retrieval_lengths, preserved_lengths, visible_lengths):
         if self.sig_topk > 0:
@@ -1311,6 +1374,8 @@ class cometkv_cache(KV_Cache):
             # Re-clamp by candidate count so the min-retrieval floor cannot exceed retrieval_len
             # (surplus slots would stay -1 and be zero-filled into the attended window).
             topk_batch = torch.minimum(topk_batch, retrieval_lengths.to(torch.int32))
+            if self.sig_max_retrieval_topk:
+                topk_batch.clamp_(max=self.sig_max_retrieval_topk)
             return torch.where(retrieval_lengths > 0, topk_batch, torch.zeros_like(topk_batch))
 
         total_budget = (visible_lengths.to(torch.float32) * self.retrieval_budget).to(torch.int32)
@@ -1328,6 +1393,8 @@ class cometkv_cache(KV_Cache):
         # Re-clamp by candidate count so the min-retrieval floor cannot exceed retrieval_len
         # (surplus slots would stay -1 and be zero-filled into the attended window).
         topk_batch = torch.minimum(topk_batch, retrieval_lengths.to(torch.int32))
+        if self.sig_max_retrieval_topk:
+            topk_batch.clamp_(max=self.sig_max_retrieval_topk)
         return torch.where(retrieval_lengths > 0, topk_batch, torch.zeros_like(topk_batch))
 
     def _asym_scores_for(self, layer_idx, device):
@@ -1404,11 +1471,26 @@ class cometkv_cache(KV_Cache):
             self._sample_state[key] = st
         return st
 
+    def _grouped_score_state_for(self, device, group):
+        key = (str(device), group)
+        state = self._grouped_score_buffers.get(key)
+        if state is None:
+            tokens = self.signature_index[0].size(2)
+            state = {
+                "logits": torch.full((self.batch_groups, group, tokens), float("-inf"),
+                                     dtype=torch.float32, device=device),
+                "chunk_lse": torch.empty((self.batch_groups, group, (tokens + 255) // 256),
+                                         dtype=torch.float32, device=device),
+                "head_lse": torch.empty((self.batch_groups, group), dtype=torch.float32, device=device),
+            }
+            self._grouped_score_buffers[key] = state
+        return state
+
     def _gather_sample_tail(self, layer_idx, st):
         # Fetch the m sampled tokens' KV through the SAME gather kernels as the head (UVA + token
         # cache / GPU-resident), writing into the dedicated tail buffers: static_len=0/recent_len=0
-        # so only the sparse section is produced. Head kh + tail m == the pre-split budget k, so
-        # total gathered bytes per step are unchanged vs pure top-k.
+        # so only the sparse section is produced. Tail is an additional independent quota;
+        # its gather traffic must be reported separately from the deterministic head.
         rows = self.batch_groups
         dim = self.head_dim
         recent_cap = self._decode_hot_capacity()
@@ -1462,35 +1544,35 @@ class cometkv_cache(KV_Cache):
     def _sampled_tail_attention(self, queries, layer_idx, out_main, lse_main):
         """Importance-corrected micro-attention over m sampled tail tokens, merged IN PLACE.
 
-        Samples m tokens (with replacement) from proposal softmax(score * beta) over the
-        non-head candidates (recomputed every sample_stride layers), gathers their KV via the
+        Samples m tokens (with replacement) from a full-support candidate proposal
+        (recomputed every sample_stride layers), gathers their KV via the
         cache-bypass UVA kernel, and runs the fused tail-attention+LSE-merge kernel with the
-        per-slot logit correction -log(m * q_j) — folding a self-normalized importance-sampling
-        estimate of FULL attention into the flash output. All shapes are plan-fixed ->
+        per-slot logit correction -log(m * q_j). The fused merge masks samples belonging to
+        the current layer's head without renormalizing their proposal probabilities.
+        All shapes are plan-fixed ->
         CUDA-graph capturable; the noise buffer is driver-refreshed per replay
-        (cg_set_step_inputs), the eager path refreshes it at layer 0.
+        (cg_set_step_inputs), the eager path refreshes it at each resample layer.
         """
         m = self.active_sample_len_host
         kh = self.active_sparse_len_host
         device = queries.device
         st = self._sample_state_for(layer_idx, device)
-        # Draws/corr are recomputed every sample_stride-th layer and shared in between:
-        # full-width proposal work (softmax+cumsum over all candidates) is ~0.1-0.2ms per
-        # layer at 96k+, x32 layers would dominate the decode step. The correction stays exact
-        # for every layer because it only needs the KNOWN probability of the distribution the
-        # draws actually came from (the last resample layer's proposal); in-between layers pay
-        # proposal staleness as extra variance, which the clip knob bounds.
+        # Keep the owner's head in the proposal: another layer can need those candidates.
+        # Draw correction always refers to this actual shared distribution, before masking.
         if st["owner"] < 0 or layer_idx % self.sample_stride == 0:
             st["owner"] = layer_idx
             if not self.use_cuda_graph:
                 st["noise"].uniform_(generator=self._sample_gen[str(device)])
             scores = self._asym_scores_for(layer_idx, device)
-            # Non-candidate slots are -inf by buffer invariant; the head is masked out on the
-            # copy — the shared score buffer must stay intact for the token-cache score-eviction
-            # priority reads in the main gather.
+            # Non-candidate slots are -inf by buffer invariant; proposal transformations
+            # leave the shared score buffer intact for token-cache priority reads.
             prop = st["prop"]
             tokens = scores.size(1)
-            if self.sample_autoscale:
+            if self.query_aggregation == "mean_prob" and not self.sample_autoscale:
+                # Scores are already log mixture probabilities, not arbitrary
+                # projection-space magnitudes. Temperature acts in log space.
+                torch.mul(scores, 1.0 / self.sample_tau, out=prop[:, :tokens])
+            elif self.sample_autoscale:
                 # Selector-agnostic proposal: z-score over the finite (candidate) slots, then
                 # scale to sigma/tau nats. -inf non-candidates stay -inf through the affine map.
                 finite = torch.isfinite(scores)
@@ -1504,8 +1586,6 @@ class cometkv_cache(KV_Cache):
             else:
                 beta = 1.0 / (self.group_size * math.sqrt(self.head_dim) * self.sample_tau)
                 torch.mul(scores, beta, out=prop[:, :tokens])
-            head_idx = self.selected_indices_buffer[:, :kh].long()
-            prop.scatter_(1, head_idx, float("-inf"))
             # Two-level (chunked) inverse-CDF sampling WITH replacement on the UNNORMALIZED
             # weights: torch's full-width cumsum is a slow path for few long rows (0.131 ms on
             # [8, 117k]); one 512-chunk reduction + tiny cumsums gives the same distribution.
@@ -1514,20 +1594,26 @@ class cometkv_cache(KV_Cache):
             ch = self._sample_chunk
             mx = prop.amax(dim=1, keepdim=True)
             w = (prop - mx).exp()                                    # [rows, tokens_pad]
+            # Normalize then mix uniform mass over the real candidate range only. The
+            # padded/non-candidate positions remain zero; all candidates have positive mass.
+            w.div_(w.sum(dim=1, keepdim=True)).mul_(1.0 - self.sample_uniform_mix)
+            w[:, self.plan_range1_start_host:self.plan_range1_end_host].add_(
+                self.sample_uniform_mix / self.active_candidates_host)
             wc = w.view(rows, -1, ch)
             chunk_sums = wc.sum(dim=2)                               # [rows, n_chunks]
             cdf_c = torch.cumsum(chunk_sums, dim=1)
             z = cdf_c[:, -1:].clamp_min(1e-30)
             vals = st["noise"][0] * z
-            cidx = torch.searchsorted(cdf_c, vals).clamp_(max=cdf_c.size(1) - 1)
+            cidx = torch.searchsorted(cdf_c, vals, right=True).clamp_(max=cdf_c.size(1) - 1)
             prev = torch.gather(
                 torch.nn.functional.pad(cdf_c, (1, 0)), 1, cidx)    # cdf mass before the chunk
             local = torch.gather(
                 wc, 1, cidx.unsqueeze(-1).expand(rows, m_draws, ch))
             local_cdf = torch.cumsum(local, dim=2)                   # [rows, m, ch] tiny
             off = torch.searchsorted(
-                local_cdf, (vals - prev).unsqueeze(-1)).squeeze(-1).clamp_(max=ch - 1)
-            draws = (cidx * ch + off).clamp_(max=tokens - 1)
+                local_cdf, (vals - prev).unsqueeze(-1), right=True).squeeze(-1).clamp_(max=ch - 1)
+            draws = (cidx * ch + off).clamp_(
+                min=self.plan_range1_start_host, max=self.plan_range1_end_host - 1)
             q_sel = (torch.gather(w, 1, draws) / z).clamp_min(1e-30)
             # Truncated-IS clip is applied INSIDE the fused kernel on the full logits
             # (s + corr, per (row,head), capped at block mean + clip): corr-only clipping
@@ -1573,11 +1659,12 @@ class cometkv_cache(KV_Cache):
             lse_main.reshape(self.batch_groups, self.group_size),
             1.0 / math.sqrt(self.head_dim),
             self.sample_clip,
+            st["draws"], self.selected_indices_buffer, kh,
         )
 
     def _grouped_query_asym_topk(self, queries, layer_idx):
         # Continuous asymmetric scores over the packed 16B/token signature index (float query
-        # projection x sign-bit keys, norm-weighted), then exact top-k. No ties, no histogram.
+        # projection x sign-bit keys, norm-weighted), then exact top-k over the active range.
         # No host syncs, fixed shapes -> CUDA-graph capturable (range/k are host plan constants).
         device = queries.device
         bsz, _, n_heads, dim = queries.shape
@@ -1593,30 +1680,65 @@ class cometkv_cache(KV_Cache):
             self.selected_indices_buffer.fill_(-1)
             self.sparse_lengths_buffer.fill_(k)
             self._asym_plan_dirty = False
-        if k > 0:
+        if k > 0 or self.active_sample_len_host > 0:
             P = self._projection_for(device)                              # [sig_bits, dim] fp32
-            qsum = (
-                queries.view(bsz, self.kv_head, group, dim)
-                .sum(dim=2, dtype=torch.float32)
-                .view(rows, dim)
-            )
-            x = torch.matmul(qsum, P.t()).contiguous()                    # [rows, sig_bits]
             bits_used = self.asym_sig_bits
-            x_total = x[:, :bits_used].sum(dim=1).contiguous()
             keys = self.signature_index[layer_idx].view(rows, -1, self.sig_bytes)
             scores = self._asym_scores_for(layer_idx, device)
-            asym_signature_score_into(
-                x, x_total, keys,
-                self.range_starts_buffer, self.range_ends_buffer, scores,
-                bits_used, int(self.active_candidates_host),
-                self.sig_norm_lo[layer_idx] if self.selector_mode == "asym_n8" else None,
-                self.sig_norm_step[layer_idx] if self.selector_mode == "asym_n8" else None,
+            normalize_heads = self.query_aggregation == "mean_prob"
+            use_lookup = self.signature_score_impl == "lookup" or (
+                self.signature_score_impl == "auto" and self.block_stats and not normalize_heads
             )
-            # sorted=False: indices are consumed as a set (gather + flash are permutation
-            # invariant). sorted=True would trip torch's k>4096 sort_outf fallback
+            grouped_queries = queries.reshape(rows, group, dim)
+            qg = (grouped_queries.float() if normalize_heads else
+                  grouped_queries.sum(dim=1, keepdim=True, dtype=torch.float32))
+            x = torch.matmul(qg, P.t()).contiguous()
+            x_total = x[:, :, :bits_used].sum(dim=-1).contiguous()
+            if not self.block_stats and not normalize_heads and not use_lookup:
+                # Explicit frozen/q_sum ablation preserves the previous kernel.
+                asym_signature_score_into(
+                    x[:, 0], x_total[:, 0].contiguous(), keys,
+                    self.range_starts_buffer, self.range_ends_buffer, scores,
+                    bits_used, int(self.active_candidates_host),
+                    self.sig_norm_lo[layer_idx], self.sig_norm_step[layer_idx],
+                )
+            else:
+                state = self._grouped_score_state_for(device, qg.size(1))
+                center_bias = torch.bmm(qg, self.sig_block_centers[layer_idx].transpose(1, 2))
+                residual_scale = self.RSQRT_DIM / self.signature_score_scale if normalize_heads else 1.0
+                bias_scale = self.RSQRT_DIM if normalize_heads else self.signature_score_scale
+                grouped_signature_score_into(
+                    x, x_total, keys, self.range_starts_buffer, self.range_ends_buffer,
+                    self.sig_block_norm_lo[layer_idx], self.sig_block_norm_step[layer_idx], center_bias,
+                    state["logits"], state["chunk_lse"], state["head_lse"], scores,
+                    bits_used, int(self.active_candidates_host),
+                    int(self.lockstep_prompt_length_host) if self.block_stats else keys.size(1),
+                    end, self._fixed_prompt_local_slide_stride(), self._fixed_prompt_local_recent_overlap(),
+                    residual_scale, bias_scale, normalize_heads, use_lookup,
+                )
+            # The torch fallback uses sorted=False: indices are consumed as a set.
+            # sorted=True would trip torch's k>4096 sort_outf fallback
             # (cub segmented sort + gather + 2 copies, ~185us/layer at 96k budgets).
-            sel = torch.topk(scores, k, dim=1, sorted=False).indices
-            self.selected_indices_buffer[:, :k].copy_(sel.to(torch.int32))
+            if k > 0:
+                use_radix = (self.exact_topk_impl != "torch" and k <= 4096
+                             and scores.device == self.selected_indices_buffer.device
+                             and (self.exact_topk_impl == "radix"
+                                  or (end - start >= 4096 and 4 * k <= end - start)))
+                if use_radix:
+                    key = str(device)
+                    workspace = self._exact_topk_workspace.get(key)
+                    if workspace is None or workspace[1].shape != scores.shape:
+                        workspace = (
+                            torch.empty((rows, (scores.size(1) + 1023) // 1024, 288),
+                                        dtype=torch.int32, device=device),
+                            torch.empty_like(scores, dtype=torch.int32),
+                            torch.empty((rows, 7), dtype=torch.int32, device=device),
+                        )
+                        self._exact_topk_workspace[key] = workspace
+                    exact_topk_indices_into(scores, self.selected_indices_buffer, *workspace, k, start, end)
+                else:
+                    sel = torch.topk(scores, k, dim=1, sorted=False).indices
+                    self.selected_indices_buffer[:, :k].copy_(sel.to(torch.int32))
 
     def _update_retrieval_plan(self, visible_lengths):
         prompt_lengths = self.prompt_lengths
@@ -1673,31 +1795,28 @@ class cometkv_cache(KV_Cache):
         retrieval_len = (range1_end - range1_start).clamp(min=0)
         range2_len = (range2_end - range2_start).clamp(min=0)
         topk_batch = self._compute_topk_for_lengths(retrieval_len, preserved_len, visible_lengths)
-        self.active_sparse_len_host = max(
-            0,
-            min(
-                int(topk_batch.max().item()),
-                self.selected_indices_buffer.size(1),
-            ),
-        )
+        self.requested_sparse_len_host = max(0, int(topk_batch.max().item()))
+        if self.requested_sparse_len_host > self.selected_indices_buffer.size(1):
+            raise RuntimeError("CometKV head budget exceeds preallocated generation capacity")
+        self.active_sparse_len_host = self.requested_sparse_len_host
+        self.budget_plan_visible_length_host = int(visible_lengths[0].item())
         # Max candidate count across rows (range1 + range2; range2 is empty in decode). Lets the topk
         # kernels launch only the chunks covering real candidates instead of the full padded signature
         # width. Updated only here (slide steps / init), reused by every step's topk launch.
         self.active_candidates_host = int((retrieval_len + range2_len).max().item())
-        # Sampled-tail split: the budget total_k becomes an exact head of kh = total_k - m plus m
-        # sampled slots. Downstream plan consumers (selector topk, cache_seqlens, recent-concat
-        # offset) all read active_sparse_len_host, so they see the HEAD length and the sampled
-        # slots live entirely in the side tail buffers. Committed only here (init/slide) -> the
-        # split is bake-safe for CUDA-graph capture like the rest of the plan.
+        # Independent tail quota: never subtract samples from the length-based head.
+        # Commit only at init/slide boundaries, keeping captured shapes fixed within a window.
         total_k = self.active_sparse_len_host
         m = 0
-        if (self.sample_frac > 0.0 and total_k > 1
-                and self.active_candidates_host > total_k):
-            m = min(int(round(self.sample_frac * total_k)), total_k - 1, self.sample_max_m)
-            if m < self.sample_min_m:
-                m = 0   # short-context guard: tiny tails are pure variance (see init note)
+        if self.active_candidates_host > total_k:
+            if self.sample_size is not None:
+                m = min(self.sample_size, self.sample_max_m)
+            elif self.sample_frac > 0.0:
+                m = min(int(round(self.sample_frac * total_k)), self.sample_max_m)
+                if m < self.sample_min_m:
+                    m = 0
         self.active_sample_len_host = m
-        self.active_sparse_len_host = total_k - m
+        self.active_retrieval_len_host = total_k + m
 
         self.range_starts_buffer[:, 0].copy_(range1_start.to(torch.int32).repeat_interleave(self.kv_head))
         self.range_ends_buffer[:, 0].copy_(range1_end.to(torch.int32).repeat_interleave(self.kv_head))
@@ -1843,35 +1962,23 @@ class cometkv_cache(KV_Cache):
                 token_start,
             )
 
+        block_idx = (1 + (int(evict_start_step) + self._fixed_prompt_local_recent_overlap())
+                     // self._fixed_prompt_local_slide_stride()) if self.block_stats else 0
         packed = self._build_prefill_signatures(
-            key_rows, layer_idx, row_start=0, freeze_norm_scale=False,
+            key_rows, layer_idx, row_start=0, freeze_norm_scale=False, block_idx=block_idx,
         )
         self.signature_index[layer_idx][:, :, token_start:token_end, :].copy_(
             packed.view(self.batch_size, self.kv_head, evict_count, self.sig_bytes)
         )
 
-        # μ EMA forward update: blend the frozen prompt mean toward the evicted batch mean.
-        # Only affects FUTURE evicted-token signature building (this batch was already centered
-        # with the old μ above). O(batch_groups × head_dim) per slide — negligible vs the
-        # signature GEMM that just ran. Disabled when mean_update_alpha == 0 (A/B baseline).
-        if self.center_keys and self.mean_update_alpha > 0.0 and self.sig_key_mean is not None:
-            evicted_mean = key_rows.float().mean(dim=1)  # [batch_groups, head_dim]
-            mu = self.sig_key_mean[layer_idx]            # [batch_groups, head_dim] fp32 GPU
-            mu.mul_(1.0 - self.mean_update_alpha).add_(evicted_mean, alpha=self.mean_update_alpha)
-
-        # Full periodic recompute: every full_recompute_interval decode tokens, recompute μ and
-        # norm range from ALL keys in the retrieval index and rebuild ALL signatures. Triggered
-        # at layer 0 only (so it runs once per step, not per layer). The per-layer rebuild happens
-        # naturally because eviction runs per-layer per-step.
-        if (self.full_recompute_interval > 0 and layer_idx == 0
-                and self.center_keys and self.sig_key_mean is not None):
-            self._recompute_decode_counter += evict_count
-            if self._recompute_decode_counter >= self.full_recompute_interval:
-                self._recompute_decode_counter = 0
-                # Recompute for ALL layers (the eviction loop calls us per-layer, but we only
-                # trigger once at layer 0; we need to recompute for every layer's signatures).
-                for ldx in range(self.layer_num):
-                    self._full_recompute_stats(ldx, token_end)
+        self.sig_active_blocks[layer_idx] = max(self.sig_active_blocks[layer_idx], block_idx + 1)
+        # Rebuild only AFTER this layer has published its own new keys. Other
+        # layers have not necessarily written [token_start:token_end] yet.
+        if self.full_recompute_interval > 0:
+            self._recompute_decode_counter[layer_idx] += evict_count
+            if self._recompute_decode_counter[layer_idx] >= self.full_recompute_interval:
+                self._recompute_decode_counter[layer_idx] %= self.full_recompute_interval
+                self._full_recompute_stats(layer_idx, token_end)
 
         if layer_idx == self.layer_num - 1:
             self.lockstep_evicted_retrieval_end_host = token_end
@@ -2356,7 +2463,9 @@ class cometkv_cache(KV_Cache):
         static_len = int(self.fixed_prompt_local_static_length_host)
         sparse_len = self._active_sparse_len_for_selected_indices(selected_indices)
         max_topk = selected_indices.size(1)
-        # Gather [static(static_len) | sparse(max_topk)] STRAIGHT into the fixed-W concat buffer:
+        # Gather only [static(static_len) | sparse(sparse_len)] into the fixed-W buffer.
+        # Preallocating for the full generation must not cause padded capacity slots to be
+        # gathered on every step. Indices/hit-mask retain their capacity stride.
         # the gather kernels take out rows wider than the produced prefix (out_row_len = W derived
         # from out.size(1)), so the old tmp-then-copy_ assembly (an extra read+write of the whole
         # sparse region, ~40-60MB/layer/step) is gone. W >= static_len + max_topk + recent_cap
@@ -2390,18 +2499,18 @@ class cometkv_cache(KV_Cache):
             if self.quantize_cpu_kv:
                 concat_static_recent_gpu_gather_int8(
                     *gather_args, self.cpu_kv_k_scale[layer_idx], self.cpu_kv_v_scale[layer_idx],
-                    tk, tv, static_len, 0, max_topk,
+                    tk, tv, static_len, 0, sparse_len,
                 )
             else:
                 concat_static_recent_gpu_gather(
-                    *gather_args, tk, tv, static_len, 0, max_topk,
+                    *gather_args, tk, tv, static_len, 0, sparse_len,
                 )
         elif self.quantize_cpu_kv:
             concat_static_recent_lookup_gather_uva_kv_update_cache_int8(
                 *gather_args, self.cpu_kv_k_scale[layer_idx], self.cpu_kv_v_scale[layer_idx],
                 tk, tv, hit, self.token_cache_ids[layer_idx], self.token_cache_locks[layer_idx],
                 self.token_cache_keys[layer_idx], self.token_cache_values[layer_idx],
-                static_len, 0, max_topk,
+                static_len, 0, sparse_len,
             )
         else:
             stamps, step_dev, ways = self._token_cache_lru_args(layer_idx)
@@ -2410,7 +2519,7 @@ class cometkv_cache(KV_Cache):
             concat_static_recent_lookup_gather_uva_kv_update_cache(
                 *gather_args, tk, tv, hit, self.token_cache_ids[layer_idx], self.token_cache_locks[layer_idx],
                 self.token_cache_keys[layer_idx], self.token_cache_values[layer_idx],
-                static_len, 0, max_topk,
+                static_len, 0, sparse_len,
                 stamps, step_dev, ways,
                 prio_buckets, prio_scores,
                 cache_prio,

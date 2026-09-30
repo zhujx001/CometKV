@@ -236,6 +236,21 @@ def test_generate_config_builds_cometkv_defaults(monkeypatch):
     assert "use_pred_q" not in config["CometKV"]
 
 
+@pytest.mark.parametrize("size,fraction,expected", [
+    (None, None, 256), ("32", None, 32), (None, "0", None), ("64", "0", 64),
+])
+def test_generate_config_independent_tail_quota(monkeypatch, size, fraction, expected):
+    pred = load_pred_module(monkeypatch)
+    for name, value in (("COMETKV_SAMPLE_SIZE", size), ("COMETKV_SAMPLE_FRAC", fraction)):
+        monkeypatch.delenv(name, raising=False)
+        if value is not None:
+            monkeypatch.setenv(name, value)
+    monkeypatch.setenv("COMETKV_MAX_RETRIEVAL_TOPK", "128")
+    cometkv = pred.generate_config(pred.DEFAULT_MODEL_PATH, 4096, "CometKV")["CometKV"]
+    assert cometkv["sample_size"] == expected
+    assert cometkv["sig_max_retrieval_topk"] == 128
+
+
 def test_generate_config_applies_cometkv_static_pattern_overrides(monkeypatch):
     pred = load_pred_module(monkeypatch)
 

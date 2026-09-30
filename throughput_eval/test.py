@@ -84,6 +84,8 @@ if __name__ == "__main__":
         cometkv_static_pattern_start=args.cometkv_static_pattern_start,
         cometkv_static_pattern_end=args.cometkv_static_pattern_end,
         cometkv_exclude_preserved_from_budget=args.cometkv_exclude_preserved_from_budget,
+        cometkv_stats_mode=args.cometkv_stats_mode,
+        cometkv_query_aggregation=args.cometkv_query_aggregation,
     )
     llm = load_model(model_name, max_len, dtype, device)
 

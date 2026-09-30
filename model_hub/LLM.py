@@ -240,6 +240,7 @@ class LLM:
         # captured graph (host ints), so a plan change without a static/topk change must still recapture.
         return (int(self.kv_cache.fixed_prompt_local_static_length_host),
                 int(self.kv_cache.active_sparse_len_host),
+                int(self.kv_cache.active_sample_len_host),
                 int(getattr(self.kv_cache, "plan_range1_start_host", 0)),
                 int(getattr(self.kv_cache, "plan_range1_end_host", 0)))
 

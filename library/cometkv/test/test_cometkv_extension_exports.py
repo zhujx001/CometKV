@@ -28,6 +28,8 @@ def test_cometkv_gather_exports_fast_path_kernels_only():
 
 def test_cometkv_signature_exports_fast_path_kernels_only():
     assert hasattr(cometkv, "asym_signature_score_into")
+    assert hasattr(cometkv, "grouped_signature_score_into")
+    assert hasattr(cometkv, "exact_topk_indices_into")
     assert hasattr(cometkv, "sampled_tail_attention_merge")
     assert hasattr(cometkv, "uva_gather_kv_rows")
     assert hasattr(cometkv, "uva_gather_kv_rows_window")

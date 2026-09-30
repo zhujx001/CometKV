@@ -101,6 +101,8 @@ if __name__ == "__main__":
         cometkv_exclude_preserved_from_budget=args.cometkv_exclude_preserved_from_budget,
         cometkv_cpu_kv_quant=args.cometkv_cpu_kv_quant,
         cometkv_selector=args.cometkv_selector,
+        cometkv_stats_mode=args.cometkv_stats_mode,
+        cometkv_query_aggregation=args.cometkv_query_aggregation,
         cometkv_mean_update_alpha=args.cometkv_mean_update_alpha,
         cometkv_norm_margin=args.cometkv_norm_margin,
         cometkv_full_recompute_interval=args.cometkv_full_recompute_interval,

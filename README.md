@@ -2,7 +2,7 @@
 
 ## Overview
 
-CometKV accelerates long-context LLM decoding on one GPU by keeping the large retrieval portion of the KV cache in pinned CPU memory and fetching only a small attention working set through CUDA Unified Virtual Addressing (UVA). A compact hash signature selects the working set, while a sampled-tail estimator preserves information outside the highest-scoring tokens without increasing the total retrieval budget.
+CometKV accelerates long-context LLM decoding on one GPU by keeping the large retrieval portion of the KV cache in pinned CPU memory and fetching only a small attention working set through CUDA Unified Virtual Addressing (UVA). A compact hash signature selects the working set. Optional importance-corrected samples estimate contributions outside that selection using a separate, additional quota.
 
 The repository contains the paper implementation, CUDA extensions, single-GPU inference path, LongBench and RULER pipelines, latency and throughput harnesses, and focused regression tests.
 
@@ -12,18 +12,60 @@ CometKV separates each sequence into always-visible sink/recent regions and a re
 
 At each decode step:
 
-1. The query scores the GPU-resident signatures and selects an exact head within the configured budget.
-2. A fraction of that same budget is assigned to tail samples. Their logits receive importance corrections before the head and tail states are merged. The head shrinks by the number of samples, so total gathered KV remains unchanged.
+1. The query scores the GPU-resident signatures and selects a deterministic head within the configured head budget.
+2. An independent quota supplies additional samples. A shared proposal covers all retrieval candidates, mixing score probabilities with uniform probability. Each layer excludes samples already in its own head when merging the importance-corrected tail; head size is never reduced. Duplicate draws retain their multiplicity. Clipping ignores excluded slots, and an empty sampled tail leaves the main output unchanged.
 3. A set-associative GPU token cache serves recurring selections. Misses are gathered from pinned host memory over UVA and packed with the sink/recent KV for FlashAttention.
 4. The complete lockstep decode step can be captured and replayed with a CUDA graph.
 
-The default retrieval budget is `0.02`; sampled-tail defaults are `FRAC=0.25`, `TAU=1.0`, `CLIP=4`, `STRIDE=8`, `MIN_M=64`, and `MAX_M=160`.
+The current defaults extend the original frozen-statistics / summed-query selector:
+`--cometkv_stats_mode block --cometkv_query_aggregation mean_prob`. Prompt signatures
+keep their original statistics. At each 128-token decode-window slide, newly evicted
+keys receive a separate mean and log-norm range (the first block has 96 tokens with
+the default 32-token overlap). Historical signatures and their statistics stay fixed.
+Scoring adds the query-dependent offset between each block mean and the prompt mean,
+so centering does not introduce an uncompensated bias between blocks.
+
+Each GQA query head scores candidates separately. Its calibrated logits are normalized
+with a softmax over retrieval candidates, and the head probabilities are averaged
+before top-k. The kernel stores the log of this average, which preserves the ranking.
+Simply summing linear per-head scores would be identical to summing the queries.
+This is a candidate-conditional selector, not exact full-attention probabilities.
+Quality gains from the new aggregation require task evaluation; they are not guaranteed.
+
+Four query heads share signature loads in the CUDA scorer. Its scratch space is shared
+between layers; block metadata costs `(head_dim + 2) * 4` bytes per block per KV head
+per layer (520 bytes at dimension 128), in addition to the 16-byte token signatures.
+Use `--cometkv_stats_mode frozen --cometkv_query_aggregation q_sum` to reproduce the
+previous scoring rule. The head budget is refreshed on window slides using visible
+length; buffers now cover the entire planned generation. Within each window k stays
+fixed, and `COMETKV_MAX_RETRIEVAL_TOPK` can explicitly cap it. Preallocation does not
+cause unused capacity slots to be gathered. This is length-based allocation, without
+an online quality controller. See [tail and budget repair](report/cometkv_tail_budget_fix.md).
+
+The default head retrieval budget is `0.02`. Tail defaults are `SIZE=256`, `TAU=1.0`,
+`CLIP=4`, `STRIDE=8` (layers), `UNIFORM_MIX=0.1`, and `MAX_M=256`. Set
+`COMETKV_SAMPLE_SIZE=0` for pure top-k, or `32`/`64`/`128`/`256` for an explicit additional
+draw count per layer and KV head. These sizes are starting configurations, not measured
+quality optima. The old `COMETKV_SAMPLE_FRAC` override still derives a sample count
+from k with `MIN_M=64`, but now also adds that count outside the head budget. Explicit
+`COMETKV_SAMPLE_SIZE` takes precedence; `COMETKV_SAMPLE_FRAC=0` still disables sampling
+when SIZE is unset. Neither tail nor preserved-token traffic should be hidden in the
+reported head retrieval ratio.
+
+The sampled-tail merge uses an exact shared-memory head set and vectorized, parallel
+reductions for aligned 128-dimensional KV. See the [NCU optimization report](report/cometkv_ncu_optimization.md)
+for hardware counters, numerical checks, and kernel/model latency comparisons.
+
+The selector now uses exact radix top-k for long sparse ranges and FP32 nibble
+lookup scoring for block/q_sum. See the [selector optimization report](report/cometkv_selector_optimization.md)
+for the Tensor Core experiments and controlled comparisons. Large k falls back
+to torch top-k without reducing the retrieval budget.
 
 ## Backends
 
 | `attn_type` | Retrieval KV | Selection and purpose |
 |---|---|---|
-| `CometKV` | Pinned CPU memory, gathered through UVA | Paper backend: `asym_n8`, sampled tail, and GPU token cache |
+| `CometKV` | Pinned CPU memory, gathered through UVA | `asym_n8`, block compensation, GQA probability aggregation, sampled tail, and GPU token cache |
 | `CometKV_GPU` | GPU memory | Same retrieval method without host-transfer cost; useful for controlled speed comparisons and moderate contexts |
 | `Full_Flash_Attn` | Dense GPU KV | Full-attention baseline |
 | `Exact_TopK` | Dense GPU KV | Exact query-key top-k oracle; eager decode only and supported for Llama/Mistral, not Qwen |
@@ -74,7 +116,7 @@ python -u simple_test.py \
   --profile_timing
 ```
 
-Useful alternatives are `--attn_type Full_Flash_Attn`, `--attn_type CometKV_GPU`, and `--cometkv_cpu_kv_quant int8`. Use `COMETKV_SAMPLE_FRAC=0` to disable the sampled tail while retaining `asym_n8` retrieval.
+Useful alternatives are `--attn_type Full_Flash_Attn`, `--attn_type CometKV_GPU`, and `--cometkv_cpu_kv_quant int8`. Use `COMETKV_SAMPLE_SIZE=0` to disable the sampled tail while retaining `asym_n8` retrieval.
 
 ## Data preparation (one-click)
 
@@ -169,23 +211,30 @@ Command-line arguments configure the stable public interface; environment variab
 | `--retrieval_budget` | `0.02` | Fraction of the visible sequence allocated to retrieval |
 | `--cometkv_static_pattern_start` / `_end` | `4` / `32` | Always-visible sink / prompt-recent window sizes (unified across model templates and wrappers) |
 | `--cometkv_selector` / `COMETKV_SELECTOR` | `asym_n8` | The supported 16-byte hash-signature selector |
+| `--cometkv_stats_mode` / `COMETKV_STATS_MODE` | `block` | Per-eviction-block mean and norm scale with score compensation; `frozen` uses prompt statistics |
+| `--cometkv_query_aggregation` / `COMETKV_QUERY_AGG` | `mean_prob` | Average per-query candidate softmax probabilities before top-k; `q_sum` restores summed-query scoring |
+| `COMETKV_SCORE_IMPL` | `auto` | FP32 lookup for block/q_sum, scalar otherwise; `scalar` / `lookup` select an explicit implementation |
+| `COMETKV_TOPK_IMPL` | `auto` | Exact radix selection for ≥4096 candidates and K≤min(4096,candidates/4); `torch` / `radix` select a comparison path; K>4096 retains the full budget via torch |
 | `--cometkv_min_retrieval_topk` / `COMETKV_MIN_RETRIEVAL_TOPK` | `16` | Minimum retrieved tokens per row; the environment form is consumed by wrappers |
 | `--cometkv_token_cache_size` / `COMETKV_TOKEN_CACHE_SIZE` | `1024` | Initial per-row token-cache floor; the environment form is consumed by wrappers |
-| `COMETKV_SAMPLE_FRAC` | `0.25` | Fraction of the fixed retrieval budget assigned to tail samples; `0` disables sampling |
+| `COMETKV_MAX_RETRIEVAL_TOPK` | `0` | Explicit upper bound on head k; `0` means no extra cap beyond length and candidates |
+| `COMETKV_SAMPLE_SIZE` | `256` in generated configs | Additional sample slots per layer/KV head; `0` disables; overrides FRAC |
+| `COMETKV_SAMPLE_FRAC` | unset | Compatibility override: derive additional sample count from head k; never reduces head |
 | `COMETKV_SAMPLE_TAU` / `COMETKV_SAMPLE_SEED` | `1.0` / `1234` | Proposal temperature and deterministic sampling seed |
 | `COMETKV_SAMPLE_CLIP` | `4.0` | Cap for corrected tail logits in nats; `0` disables clipping |
 | `COMETKV_SAMPLE_STRIDE` | `8` | Resample cadence across layers |
-| `COMETKV_SAMPLE_MIN_M` / `COMETKV_SAMPLE_MAX_M` | `64` / `160` | Minimum useful tail size and hard tail-size cap |
-| `COMETKV_SAMPLE_AUTOSCALE` / `COMETKV_SAMPLE_SIGMA` | `1` / `2.0` | Standardize proposal scores and set their target scale |
+| `COMETKV_SAMPLE_MIN_M` / `COMETKV_SAMPLE_MAX_M` | `64` / `256` | Minimum for fraction-derived counts only; hard cap applies to all sample counts |
+| `COMETKV_SAMPLE_UNIFORM_MIX` | `0.1` | Uniform mixture weight in `(0,1]`, ensuring support across all retrieval candidates |
+| `COMETKV_SAMPLE_AUTOSCALE` / `COMETKV_SAMPLE_SIGMA` | `0` for `mean_prob`, `1` for `q_sum` / `2.0` | Optional proposal standardization; `mean_prob` normally uses its log probabilities directly |
 | `COMETKV_TOKEN_CACHE_WAYS` | `8` | Set associativity; values above 2 enable stamped W-way replacement, `2` restores the legacy stamp-free path |
 | `COMETKV_TOKEN_CACHE_POLICY` | `score` | `score` evicts the worst-selector-priority way (paper default); `lru` evicts the least recently used |
 | `COMETKV_TOKEN_CACHE_MULT` | `4.0` | Target cache capacity relative to retrieval top-k |
 | `COMETKV_TOKEN_CACHE_RESERVE_GB` | `4.0` | VRAM reserved after token-cache sizing |
-| `COMETKV_NO_KEY_CENTER` | `0` | Set to `1` to disable prompt-mean key centering |
+| `COMETKV_NO_KEY_CENTER` | `0` | Set to `1` to disable key centering and mean compensation; block norm ranges still update |
 | `--cometkv_cpu_kv_quant` / `COMETKV_CPU_KV_QUANT` | `none` | `int8` stores retrieval K per channel and V per token, then dequantizes on gather |
-| `COMETKV_MEAN_UPDATE_ALPHA` | `0.0` | EMA update for the prompt key mean on decode eviction |
-| `COMETKV_NORM_MARGIN` | `0.0` | Margin around the prompt-derived log-norm range |
-| `COMETKV_FULL_RECOMPUTE_INTERVAL` | `0` | Rebuild mean, norm range, and signatures every N decode tokens; `0` disables it |
+| `COMETKV_MEAN_UPDATE_ALPHA` | `0.0` | Nonzero forward-only EMA is rejected because old signatures require their original statistics |
+| `COMETKV_NORM_MARGIN` | `0.0` | Margin around each newly sealed block's log-norm range |
+| `COMETKV_FULL_RECOMPUTE_INTERVAL` | `0` | Frozen-mode ablation: periodically rebuild all statistics/signatures on eviction boundaries; incompatible with block mode |
 | `COMETKV_EXCLUDE_PRESERVED_FROM_BUDGET` / `COMETKV_INCLUDE_PRESERVED_IN_BUDGET` | exclude | LongBench wrapper budget accounting for sink/recent tokens |
 | `COMETKV_CG_DIRECT_GATHER` | `1` | Directly gather into fixed CUDA-graph concat buffers |
 | `COMETKV_CG_EAGER` | `0` | Debug escape hatch that runs the graph-compatible path eagerly |

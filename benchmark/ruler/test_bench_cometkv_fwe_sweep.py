@@ -102,6 +102,21 @@ def test_subprocess_command_includes_single_length_and_batch(tmp_path):
     assert cmd[cmd.index("--jsonl_name") + 1] == "worker.jsonl"
 
 
+@pytest.mark.parametrize("stats,aggregation", [("block", "mean_prob"), ("frozen", "q_sum")])
+def test_worker_preserves_statistics_and_query_aggregation(tmp_path, monkeypatch, stats, aggregation):
+    monkeypatch.delenv("COMETKV_STATS_MODE", raising=False)
+    monkeypatch.delenv("COMETKV_QUERY_AGG", raising=False)
+    bench = load_bench_module()
+    args = bench.parse_args([
+        "--cometkv_stats_mode", stats, "--cometkv_query_aggregation", aggregation,
+    ])
+    cmd = bench.build_worker_command(args, 8192, 1, tmp_path / "out.jsonl", tmp_path / "out.csv")
+    worker = bench.parse_args(cmd[3:])
+    config = bench.build_cometkv_config(worker, 8192)["CometKV"]
+    assert config["stats_mode"] == stats
+    assert config["query_aggregation"] == aggregation
+
+
 def test_latency_entrypoint_defaults_to_fwe_data_and_single_batch():
     latency = load_module("bench_cometkv_fwe_latency.py")
 

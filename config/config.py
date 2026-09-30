@@ -18,6 +18,8 @@ def _default_cometkv_config():
         "sig_min_retrieval_topk": 16,
         "exclude_preserved_from_budget": True,
         "cpu_kv_quant": "none",
+        "stats_mode": "block",
+        "query_aggregation": "mean_prob",
         "mean_update_alpha": 0.0,
         "norm_margin": 0.0,
         "full_recompute_interval": 0,
@@ -60,17 +62,19 @@ def add_config_args(parser):
                         choices=["asym_n8"],
                         help="CometKV retrieval selector. 'asym_n8' (default): asymmetric scoring over "
                              "120 sign bits + 8-bit log-norm packed in the same 16B/token signature "
-                             "with no extra GPU memory.")
+                             "plus per-block statistics and shared scoring workspace.")
+    parser.add_argument("--cometkv_stats_mode", choices=["block", "frozen"], default="block",
+                        help="Freeze statistics per eviction block (default), or per prompt for ablation.")
+    parser.add_argument("--cometkv_query_aggregation", choices=["mean_prob", "q_sum"], default="mean_prob",
+                        help="Rank the mean of per-query candidate probabilities; q_sum is the legacy ablation.")
     parser.add_argument("--cometkv_mean_update_alpha", type=float, default=0.0,
-                        help="EMA alpha for prompt-frozen key mean update on decode eviction. "
-                             "0.0 = frozen (default, A/B baseline). 0.1 = moderate adaptation.")
+                        help="Deprecated forward-only EMA. Must be 0; use --cometkv_stats_mode block.")
     parser.add_argument("--cometkv_norm_margin", type=float, default=0.0,
-                        help="Widen the frozen log-norm quantization range by this fraction at prefill. "
-                             "0.0 = exact prompt range (default). 0.3 = 30%% margin each side.")
+                        help="Widen each newly sealed block's log-norm range by this fraction. "
+                             "0.0 = observed range (default). 0.3 = 30%% margin each side.")
     parser.add_argument("--cometkv_full_recompute_interval", type=int, default=0,
-                        help="Every N decode tokens, recompute μ and norm range from ALL retrieval keys "
-                             "and rebuild ALL signatures. 0 = disabled (default). 156 = recompute every "
-                             "~156 decode tokens.")
+                        help="Frozen-mode ablation: rebuild all statistics/signatures on eviction "
+                             "boundaries after N evicted tokens. 0 = disabled; incompatible with block mode.")
     return parser
 
 
@@ -105,6 +109,8 @@ def generate_config(
     cometkv_mean_update_alpha=0.0,
     cometkv_norm_margin=0.0,
     cometkv_full_recompute_interval=0,
+    cometkv_stats_mode="block",
+    cometkv_query_aggregation="mean_prob",
 ):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     MODEL_NAME = model_name.split("/")[-1]+'.json'
@@ -127,6 +133,8 @@ def generate_config(
         _config[attn_type]["sig_seed"] = int(sig_seed)
         _config[attn_type]["sig_chunk_size"] = int(sig_chunk_size)
         _config[attn_type]["sig_min_retrieval_topk"] = max(int(cometkv_min_retrieval_topk), 0)
+        _config[attn_type]["sig_max_retrieval_topk"] = int(os.environ.get(
+            "COMETKV_MAX_RETRIEVAL_TOPK", _config[attn_type].get("sig_max_retrieval_topk", 0)))
         _config[attn_type]["sig_token_cache_size"] = int(cometkv_token_cache_size)
         _config[attn_type]["exclude_preserved_from_budget"] = bool(cometkv_exclude_preserved_from_budget)
         # Environment override lets benchmark scripts toggle int8 without adding wrapper flags.
@@ -138,14 +146,17 @@ def generate_config(
         _config[attn_type]["sig_selector"] = str(
             os.environ.get("COMETKV_SELECTOR", _config[attn_type].get("sig_selector", cometkv_selector))
         )
-        # Mean update alpha: EMA blending factor for the prompt-frozen key mean μ on each decode
-        # eviction. 0.0 = frozen (A/B baseline). Env: COMETKV_MEAN_UPDATE_ALPHA=0.1
+        _config[attn_type]["stats_mode"] = os.environ.get("COMETKV_STATS_MODE", cometkv_stats_mode).lower()
+        _config[attn_type]["query_aggregation"] = os.environ.get(
+            "COMETKV_QUERY_AGG", cometkv_query_aggregation
+        ).lower()
+        # Kept for configuration compatibility. Nonzero forward-only EMA is rejected by
+        # the cache because old signatures require their original center and norm scale.
         _config[attn_type]["mean_update_alpha"] = float(
             os.environ.get("COMETKV_MEAN_UPDATE_ALPHA",
                            _config[attn_type].get("mean_update_alpha", cometkv_mean_update_alpha))
         )
-        # Norm margin: widen the frozen log-norm quantization range by this fraction at prefill.
-        # 0.0 = exact prompt range. Env: COMETKV_NORM_MARGIN=0.3
+        # Widen each newly sealed block's log-norm range (prompt only in frozen mode).
         _config[attn_type]["norm_margin"] = float(
             os.environ.get("COMETKV_NORM_MARGIN",
                            _config[attn_type].get("norm_margin", cometkv_norm_margin))
@@ -154,23 +165,18 @@ def generate_config(
             os.environ.get("COMETKV_FULL_RECOMPUTE_INTERVAL",
                            _config[attn_type].get("full_recompute_interval", cometkv_full_recompute_interval))
         )
-        # Sampled-tail hybrid estimator (paper final method, 07-07 doc §9.5): sample_frac of the
-        # retrieval budget k is drawn from the tail with importance-corrected logits (head shrinks
-        # to k-m, so the TOTAL gather budget is unchanged). ON by default (0.25). The runtime
-        # keeps the default safe at both ends: m is hard-
-        # capped at COMETKV_SAMPLE_MAX_M (160, bounds always-miss tail PCIe traffic at long
-        # context) and sampling auto-disables below COMETKV_SAMPLE_MIN_M (64, short-context
-        # pure-variance guard). Disable per run:
-        #   COMETKV_SAMPLE_FRAC=0 bash scripts/run_ruler.sh
-        # Lowercase to match the cache's selector normalization (cometkv_cache lowercases
-        # sig_selector before dispatch, so COMETKV_SELECTOR=ASYM_N8 must still gate on).
-        _sample_frac_default = (
-            0.25 if str(_config[attn_type]["sig_selector"]).lower() in ("asym_n8",)
-            else 0.0
-        )
+        # Tail is an independent quota, default 256 draws in addition to the head budget.
+        # SIZE=0 disables it. Legacy FRAC overrides still derive a count from head k, but
+        # never subtract it from the head. Explicit SIZE takes precedence over FRAC.
+        if "COMETKV_SAMPLE_SIZE" in os.environ:
+            _config[attn_type]["sample_size"] = int(os.environ["COMETKV_SAMPLE_SIZE"])
+        elif "COMETKV_SAMPLE_FRAC" in os.environ:
+            _config[attn_type]["sample_size"] = None
+        else:
+            _config[attn_type].setdefault("sample_size", 256)
         _config[attn_type]["sample_frac"] = float(
             os.environ.get("COMETKV_SAMPLE_FRAC",
-                           _config[attn_type].get("sample_frac", _sample_frac_default))
+                           _config[attn_type].get("sample_frac", 0.0))
         )
         _config[attn_type]["sample_tau"] = float(
             os.environ.get("COMETKV_SAMPLE_TAU", _config[attn_type].get("sample_tau", 1.0))

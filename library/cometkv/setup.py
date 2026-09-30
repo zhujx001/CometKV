@@ -15,6 +15,7 @@ ext_modules = [
     CUDAExtension(
         'cometkv.CometKVSignature',
         sources=[f'{src_dir}/cometkv_signature.cu'],
+        depends=[f'{src_dir}/cometkv_signature_kernel.cuh', f'{src_dir}/cometkv_topk_kernel.cuh'],
         extra_compile_args=cuda_compile_args,
         extra_link_args=['-lcuda', '-lcudart'],
     ),

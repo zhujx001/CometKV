@@ -256,6 +256,8 @@ def get_pred(llm, data, max_new_tokens, prompt_format, model_name, model_path, m
             cometkv_static_pattern_end=getattr(args, "cometkv_static_pattern_end", None),
             cometkv_exclude_preserved_from_budget=getattr(args, "cometkv_exclude_preserved_from_budget", True),
             cometkv_selector=getattr(args, "cometkv_selector", "asym_n8"),
+            cometkv_stats_mode=getattr(args, "cometkv_stats_mode", "block"),
+            cometkv_query_aggregation=getattr(args, "cometkv_query_aggregation", "mean_prob"),
         )
 
         out = llm.generate(

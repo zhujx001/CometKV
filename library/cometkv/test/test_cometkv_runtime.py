@@ -1881,7 +1881,7 @@ def _unpack_pm1(packed, bits):
 def test_asym_n8_selector_kernel_matches_torch_reference():
     seq_len = 96
     cache = make_cache(layer_num=1, max_length=128, sig_selector="asym_n8", sig_topk=9,
-                       sig_min_retrieval_topk=0)
+                       sig_min_retrieval_topk=0, stats_mode="frozen", query_aggregation="q_sum")
     q = torch.randn((1, seq_len, 4, 128), dtype=DTYPE, device=DEVICE)
     k = torch.randn((1, seq_len, 2, 128), dtype=DTYPE, device=DEVICE)
     v = torch.randn_like(k)
@@ -1949,7 +1949,7 @@ def test_asym_n8_prefill_packs_sign_bits_and_norm_byte():
 def test_asym_n8_decode_selects_norm_weighted_topk():
     seq_len = 96
     cache = make_cache(layer_num=1, max_length=128, sig_selector="asym_n8", sig_topk=7,
-                       sig_min_retrieval_topk=0)
+                       sig_min_retrieval_topk=0, stats_mode="frozen", query_aggregation="q_sum")
     q = torch.randn((1, seq_len, 4, 128), dtype=DTYPE, device=DEVICE)
     k = torch.randn((1, seq_len, 2, 128), dtype=DTYPE, device=DEVICE)
     v = torch.randn_like(k)
@@ -2048,21 +2048,23 @@ def _make_sampled_cache(monkeypatch, frac, selector="asym_n8", seq_len=96, sig_t
     return cache
 
 
-def test_sampled_tail_plan_split_conserves_budget(monkeypatch):
+def test_sampled_tail_is_additional_to_head_budget(monkeypatch):
     cache0 = _make_sampled_cache(monkeypatch, 0.0)
     total_k = cache0.active_sparse_len_host
     assert cache0.active_sample_len_host == 0
     cache = _make_sampled_cache(monkeypatch, 0.25)
-    assert cache.active_sample_len_host == min(int(round(0.25 * total_k)), total_k - 1)
-    assert cache.active_sparse_len_host + cache.active_sample_len_host == total_k
+    assert cache.active_sample_len_host == int(round(0.25 * total_k))
+    assert cache.active_sparse_len_host == total_k
+    assert cache.active_retrieval_len_host == total_k + cache.active_sample_len_host
 
 
 def test_sampled_tail_decode_matches_contract_oracle(monkeypatch):
     # Full eager decode step with sampling on, checked against a contract-derived fp32
     # reference: (a) the draws must equal inverse-CDF sampling of the proposal rebuilt from
-    # the score buffer with the head masked out; (b) the returned attention must equal ONE
+    # the full score buffer plus uniform mixture; (b) the returned attention must equal ONE
     # softmax over [main concat rows] U [sampled slots with -log(m*q_j) corrected logits] —
     # which independently validates both the correction wiring and the LSE merge identity.
+    monkeypatch.setenv("COMETKV_SAMPLE_AUTOSCALE", "1")
     cache = _make_sampled_cache(monkeypatch, 0.25)
     m, kh = cache.active_sample_len_host, cache.active_sparse_len_host
     assert m > 0
@@ -2088,17 +2090,17 @@ def test_sampled_tail_decode_matches_contract_oracle(monkeypatch):
     scale = (cache.sample_sigma / cache.sample_tau) / variance.sqrt().clamp_min(1e-6)
     torch.mul(scores - mean, scale, out=prop[:, :tokens])
     head = cache.selected_indices_buffer[:, :kh].long()
-    prop = prop.scatter(1, head, float("-inf"))
     draws_rt = st["draws"].long()
-    # Contract (a): draws stay inside the candidate support and never hit the exact head.
+    # Contract (a): draws cover all candidates, including the owner's head. The merge
+    # excludes the CURRENT head without changing proposal probabilities.
     assert int(draws_rt.max()) < tokens
-    for r in range(draws_rt.size(0)):
-        assert not torch.isin(draws_rt[r], head[r]).any(), "sampled a head slot"
     assert torch.isfinite(torch.gather(prop, 1, draws_rt)).all(), "sampled a -inf slot"
     # Contract (b): the stored correction equals -log(m * P(draw)) under the actual proposal
-    # (this is THE unbiasedness invariant: any known proposal works, but the correction must
-    # use its true probabilities). Mirror the runtime's normalization reduction order.
+    # Mirror normalization; full support and exclusion of the current head are also required.
     w = (prop - prop.amax(dim=1, keepdim=True)).exp()
+    w.div_(w.sum(1, keepdim=True)).mul_(1 - cache.sample_uniform_mix)
+    w[:, cache.plan_range1_start_host:cache.plan_range1_end_host].add_(
+        cache.sample_uniform_mix / cache.active_candidates_host)
     z = w.view(w.size(0), -1, ch).sum(dim=2).cumsum(dim=1)[:, -1:].clamp_min(1e-30)
     q_sel_ref = (torch.gather(w, 1, draws_rt) / z).clamp_min(1e-30)
     corr_ref = -(math.log(m) + torch.log(q_sel_ref))
@@ -2118,6 +2120,8 @@ def test_sampled_tail_decode_matches_contract_oracle(monkeypatch):
     qg = queries.reshape(rows, cache.group_size, dim).float()
     lg_main = torch.bmm(qg, k_main.transpose(1, 2)) / math.sqrt(dim)
     lg_tail = torch.bmm(qg, k_tail.transpose(1, 2)) / math.sqrt(dim) + corr.unsqueeze(1)
+    overlap = (draws_rt[:, :, None] == head[:, None, :]).any(-1)
+    lg_tail.masked_fill_(overlap[:, None], -float("inf"))
     w = torch.softmax(torch.cat((lg_main, lg_tail), dim=-1), dim=-1)
     ref = torch.bmm(w, torch.cat((v_main, v_tail), dim=1))
     torch.testing.assert_close(out.float().reshape(rows, cache.group_size, dim), ref,
@@ -2152,7 +2156,11 @@ def test_sampled_tail_clip_caps_at_mean_plus_clip(monkeypatch):
     qg = queries.reshape(rows, cache.group_size, dim).float()
     lg_main = torch.bmm(qg, k_main.transpose(1, 2)) / math.sqrt(dim)
     lg_tail = torch.bmm(qg, k_tail.transpose(1, 2)) / math.sqrt(dim) + corr.unsqueeze(1)
-    cap = lg_tail.mean(dim=-1, keepdim=True) + clip
+    head = cache.selected_indices_buffer[:, :kh].long()
+    valid = ~(st["draws"].long()[:, :, None] == head[:, None, :]).any(-1)
+    cap = (lg_tail.masked_fill(~valid[:, None], 0).sum(-1, keepdim=True)
+           / valid.sum(-1)[:, None, None].clamp_min(1)) + clip
+    lg_tail.masked_fill_(~valid[:, None], -float("inf"))
     assert (lg_tail > cap).any(), "clip must actually bite on this workload"
     lg_tail = torch.minimum(lg_tail, cap)
     w = torch.softmax(torch.cat((lg_main, lg_tail), dim=-1), dim=-1)
