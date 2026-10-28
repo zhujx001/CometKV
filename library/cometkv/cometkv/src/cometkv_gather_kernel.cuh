@@ -454,71 +454,8 @@ __global__ void concat_static_recent_lookup_gather_uva_kv_update_cache_kernel(
             out_key_vec[out_vec_offset + lane] = key_vec;
             out_value_vec[out_vec_offset + lane] = value_vec;
         }
-        __syncthreads();
-
-        __shared__ int selected_slot_vec;
-        if (lane == 0) {
-            if (lru) {
-                // One lock per set (the set's first slot); pick the LRU/empty victim under it.
-                // With a priority buffer ("score" policy) the victim is the worst-current-score
-                // way instead of the least-recently-used one.
-                int32_t* set_lock = cache_locks + row_base + set_base;
-                while (atomicCAS(set_lock, 0, 1) != 0) {
-                }
-                const bool scored = prio_buckets != nullptr || prio_scores != nullptr;
-                const int victim = scored
-                    ? scored_pick_victim_way(
-                          cache_token_ids + row_base + set_base,
-                          cache_stamps + row_base + set_base, token, ways,
-                          prio_buckets == nullptr
-                              ? nullptr
-                              : prio_buckets + static_cast<int64_t>(row) * prio_stride,
-                          prio_scores == nullptr
-                              ? nullptr
-                              : prio_scores + static_cast<int64_t>(row) * prio_stride,
-                          step_ptr == nullptr ? 0 : step_ptr[0])
-                    : lru_pick_victim_way(
-                          cache_token_ids + row_base + set_base,
-                          cache_stamps + row_base + set_base, token, ways);
-                selected_slot_vec = set_base + victim;
-            } else {
-                int32_t* primary_lock = cache_locks + row_base + primary_slot;
-                while (atomicCAS(primary_lock, 0, 1) != 0) {
-                }
-                const int primary_token = cache_token_ids[row_base + primary_slot];
-                if (primary_token < 0 || primary_token == token) {
-                    selected_slot_vec = primary_slot;
-                } else {
-                    atomicExch(primary_lock, 0);
-                    int32_t* secondary_lock = cache_locks + row_base + secondary_slot;
-                    while (atomicCAS(secondary_lock, 0, 1) != 0) {
-                    }
-                    selected_slot_vec = secondary_slot;
-                }
-            }
-        }
-        __syncthreads();
-
-        const int cache_vec_offset = (row_base + selected_slot_vec) * vec_count;
-        if (lane < vec_count) {
-            cache_key_vec[cache_vec_offset + lane] = key_vec;
-            cache_value_vec[cache_vec_offset + lane] = value_vec;
-        }
-        __syncthreads();
-
-        if (lane == 0) {
-            cache_token_ids[row_base + selected_slot_vec] = token;
-            if (lru && step_ptr != nullptr) {
-                cache_stamps[row_base + selected_slot_vec] = step_ptr[0];
-                if (cache_prio != nullptr && prio_buckets != nullptr) {
-                    cache_prio[row_base + selected_slot_vec] =
-                        prio_buckets[static_cast<int64_t>(row) * prio_stride + token];
-                }
-            }
-            __threadfence();
-            // Release the lock actually held: the set lock (LRU) or the chosen slot lock (2-way).
-            atomicExch(cache_locks + row_base + (lru ? set_base : selected_slot_vec), 0);
-        }
+        // All attention reads finish before a separate kernel mutates cache slots.
+        // A concurrent miss must never overwrite a slot another block is reading.
         return;
     }
 
@@ -590,39 +527,113 @@ __global__ void concat_static_recent_lookup_gather_uva_kv_update_cache_kernel(
         out_keys[out_offset + col] = key_value;
         out_values[out_offset + col] = value_value;
     }
-    __syncthreads();
+    // Cache insertion runs after this entire gather grid has completed.
+}
 
+
+// This second grid runs on the gather stream after every output row is ready.
+// Hits therefore read an immutable cache snapshot, while misses populate the
+// cache from the exact output that attention will consume. Replacement may be
+// concurrent, but never overlaps reads of cache K/V from the same gather call.
+__global__ void update_token_cache_from_gathered_rows_kernel(
+    const int32_t* request_token_ids,
+    const int32_t* hit_mask,
+    const uint16_t* gathered_keys,
+    const uint16_t* gathered_values,
+    int32_t* cache_token_ids,
+    int32_t* cache_locks,
+    uint16_t* cache_keys,
+    uint16_t* cache_values,
+    int rows,
+    int request_count,
+    int sparse_len,
+    int gathered_row_len,
+    int gathered_sparse_offset,
+    int cache_size,
+    int dim,
+    int32_t* cache_stamps,
+    const int32_t* step_ptr,
+    int ways,
+    const int16_t* prio_buckets,
+    const float* prio_scores,
+    int prio_stride,
+    int16_t* cache_prio) {
+    const int row = blockIdx.x, request_idx = blockIdx.y, lane = threadIdx.x;
+    if (row >= rows || request_idx >= sparse_len || request_idx >= request_count) return;
+    const int request_offset = row * request_count + request_idx;
+    const int token = request_token_ids[request_offset];
+    if (token < 0 || hit_mask[request_offset]) return;
+
+    const int row_base = row * cache_size;
+    // Preserve the original generic-dimension legacy mapping; W-way policies
+    // are used by the production head_dim=128 path.
+    const bool lru = dim == 128 && cache_stamps != nullptr;
+    const int set_base = lru ? lru_set_base(token, cache_size, ways) : 0;
+    const int primary_slot = lru ? 0 : primary_cache_slot(token, cache_size);
+    const int secondary_slot = lru ? 0 : secondary_cache_slot(token, cache_size);
     __shared__ int selected_slot;
     if (lane == 0) {
-        int32_t* primary_lock = cache_locks + row_base + primary_slot;
-        while (atomicCAS(primary_lock, 0, 1) != 0) {
-        }
-        const int primary_token = cache_token_ids[row_base + primary_slot];
-        if (primary_token < 0 || primary_token == token) {
-            selected_slot = primary_slot;
+        if (lru) {
+            int32_t* lock = cache_locks + row_base + set_base;
+            while (atomicCAS(lock, 0, 1) != 0) {}
+            const bool scored = prio_buckets != nullptr || prio_scores != nullptr;
+            const int victim = scored
+                ? scored_pick_victim_way(
+                      cache_token_ids + row_base + set_base,
+                      cache_stamps + row_base + set_base, token, ways,
+                      prio_buckets == nullptr ? nullptr : prio_buckets + static_cast<int64_t>(row) * prio_stride,
+                      prio_scores == nullptr ? nullptr : prio_scores + static_cast<int64_t>(row) * prio_stride,
+                      step_ptr == nullptr ? 0 : step_ptr[0])
+                : lru_pick_victim_way(cache_token_ids + row_base + set_base,
+                                      cache_stamps + row_base + set_base, token, ways);
+            selected_slot = set_base + victim;
         } else {
-            atomicExch(primary_lock, 0);
-            int32_t* secondary_lock = cache_locks + row_base + secondary_slot;
-            while (atomicCAS(secondary_lock, 0, 1) != 0) {
+            int32_t* lock = cache_locks + row_base + primary_slot;
+            while (atomicCAS(lock, 0, 1) != 0) {}
+            const int primary_token = cache_token_ids[row_base + primary_slot];
+            if (primary_token < 0 || primary_token == token) {
+                selected_slot = primary_slot;
+            } else {
+                atomicExch(lock, 0);
+                lock = cache_locks + row_base + secondary_slot;
+                while (atomicCAS(lock, 0, 1) != 0) {}
+                selected_slot = secondary_slot;
             }
-            selected_slot = secondary_slot;
         }
     }
     __syncthreads();
-
+    const int source_offset = (row * gathered_row_len + gathered_sparse_offset + request_idx) * dim;
     const int cache_offset = (row_base + selected_slot) * dim;
-    for (int col = lane; col < dim; col += blockDim.x) {
-        cache_keys[cache_offset + col] = out_keys[out_offset + col];
-        cache_values[cache_offset + col] = out_values[out_offset + col];
+    if (dim == 128) {
+        if (lane < 16) {
+            reinterpret_cast<uint4*>(cache_keys + cache_offset)[lane] =
+                reinterpret_cast<const uint4*>(gathered_keys + source_offset)[lane];
+            reinterpret_cast<uint4*>(cache_values + cache_offset)[lane] =
+                reinterpret_cast<const uint4*>(gathered_values + source_offset)[lane];
+        }
+    } else {
+        for (int col = lane; col < dim; col += blockDim.x) {
+            cache_keys[cache_offset + col] = gathered_keys[source_offset + col];
+            cache_values[cache_offset + col] = gathered_values[source_offset + col];
+        }
     }
+    // Publish every writing thread's data before the lock can be reused.
+    __threadfence();
     __syncthreads();
-
     if (lane == 0) {
         cache_token_ids[row_base + selected_slot] = token;
+        if (lru && step_ptr != nullptr) {
+            cache_stamps[row_base + selected_slot] = step_ptr[0];
+            if (cache_prio != nullptr && prio_buckets != nullptr) {
+                cache_prio[row_base + selected_slot] =
+                    prio_buckets[static_cast<int64_t>(row) * prio_stride + token];
+            }
+        }
         __threadfence();
-        atomicExch(cache_locks + row_base + selected_slot, 0);
+        atomicExch(cache_locks + row_base + (lru ? set_base : selected_slot), 0);
     }
 }
+
 
 
 template <typename scalar_t>
