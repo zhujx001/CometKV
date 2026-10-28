@@ -535,6 +535,9 @@ __global__ void concat_static_recent_lookup_gather_uva_kv_update_cache_kernel(
 // Hits therefore read an immutable cache snapshot, while misses populate the
 // cache from the exact output that attention will consume. Replacement may be
 // concurrent, but never overlaps reads of cache K/V from the same gather call.
+// One warp per request (four per block): with ~99% hit rates almost every request
+// returns after reading hit_mask, so a block per request would mostly schedule empty
+// blocks, while a single thread per miss would serialize the 512-byte copy.
 __global__ void update_token_cache_from_gathered_rows_kernel(
     const int32_t* request_token_ids,
     const int32_t* hit_mask,
@@ -558,24 +561,25 @@ __global__ void update_token_cache_from_gathered_rows_kernel(
     const float* prio_scores,
     int prio_stride,
     int16_t* cache_prio) {
-    const int row = blockIdx.x, request_idx = blockIdx.y, lane = threadIdx.x;
+    const int row = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int request_idx = blockIdx.y * (blockDim.x / 32) + threadIdx.x / 32;
     if (row >= rows || request_idx >= sparse_len || request_idx >= request_count) return;
     const int request_offset = row * request_count + request_idx;
     const int token = request_token_ids[request_offset];
-    if (token < 0 || hit_mask[request_offset]) return;
+    if (token < 0 || hit_mask[request_offset]) return;  // uniform across the warp
 
     const int row_base = row * cache_size;
     // Preserve the original generic-dimension legacy mapping; W-way policies
     // are used by the production head_dim=128 path.
     const bool lru = dim == 128 && cache_stamps != nullptr;
-    const int set_base = lru ? lru_set_base(token, cache_size, ways) : 0;
-    const int primary_slot = lru ? 0 : primary_cache_slot(token, cache_size);
-    const int secondary_slot = lru ? 0 : secondary_cache_slot(token, cache_size);
-    __shared__ int selected_slot;
+    int selected_slot = 0;
+    int lock_slot = 0;
     if (lane == 0) {
         if (lru) {
-            int32_t* lock = cache_locks + row_base + set_base;
-            while (atomicCAS(lock, 0, 1) != 0) {}
+            const int set_base = lru_set_base(token, cache_size, ways);
+            lock_slot = set_base;
+            while (atomicCAS(cache_locks + row_base + lock_slot, 0, 1) != 0) {}
             const bool scored = prio_buckets != nullptr || prio_scores != nullptr;
             const int victim = scored
                 ? scored_pick_victim_way(
@@ -588,20 +592,20 @@ __global__ void update_token_cache_from_gathered_rows_kernel(
                                       cache_stamps + row_base + set_base, token, ways);
             selected_slot = set_base + victim;
         } else {
-            int32_t* lock = cache_locks + row_base + primary_slot;
-            while (atomicCAS(lock, 0, 1) != 0) {}
+            const int primary_slot = primary_cache_slot(token, cache_size);
+            lock_slot = primary_slot;
+            while (atomicCAS(cache_locks + row_base + lock_slot, 0, 1) != 0) {}
             const int primary_token = cache_token_ids[row_base + primary_slot];
             if (primary_token < 0 || primary_token == token) {
                 selected_slot = primary_slot;
             } else {
-                atomicExch(lock, 0);
-                lock = cache_locks + row_base + secondary_slot;
-                while (atomicCAS(lock, 0, 1) != 0) {}
-                selected_slot = secondary_slot;
+                atomicExch(cache_locks + row_base + lock_slot, 0);
+                selected_slot = lock_slot = secondary_cache_slot(token, cache_size);
+                while (atomicCAS(cache_locks + row_base + lock_slot, 0, 1) != 0) {}
             }
         }
     }
-    __syncthreads();
+    selected_slot = __shfl_sync(0xffffffffu, selected_slot, 0);
     const int source_offset = (row * gathered_row_len + gathered_sparse_offset + request_idx) * dim;
     const int cache_offset = (row_base + selected_slot) * dim;
     if (dim == 128) {
@@ -612,14 +616,14 @@ __global__ void update_token_cache_from_gathered_rows_kernel(
                 reinterpret_cast<const uint4*>(gathered_values + source_offset)[lane];
         }
     } else {
-        for (int col = lane; col < dim; col += blockDim.x) {
+        for (int col = lane; col < dim; col += 32) {
             cache_keys[cache_offset + col] = gathered_keys[source_offset + col];
             cache_values[cache_offset + col] = gathered_values[source_offset + col];
         }
     }
-    // Publish every writing thread's data before the lock can be reused.
+    // Publish every writing lane's data before the lock can be reused.
     __threadfence();
-    __syncthreads();
+    __syncwarp();
     if (lane == 0) {
         cache_token_ids[row_base + selected_slot] = token;
         if (lru && step_ptr != nullptr) {
@@ -630,7 +634,7 @@ __global__ void update_token_cache_from_gathered_rows_kernel(
             }
         }
         __threadfence();
-        atomicExch(cache_locks + row_base + (lru ? set_base : selected_slot), 0);
+        atomicExch(cache_locks + row_base + lock_slot, 0);
     }
 }
 

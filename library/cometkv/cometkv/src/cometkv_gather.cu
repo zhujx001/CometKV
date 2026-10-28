@@ -633,8 +633,9 @@ void concat_static_recent_lookup_gather_uva_kv_update_cache(
     // Stream ordering is the global barrier between immutable cache reads and
     // cache replacement. Captured graphs preserve this dependency as well.
     if (sparse_len > 0) {
-        dim3 update_grid(rows, static_cast<unsigned int>(sparse_len));
-        cometkv::update_token_cache_from_gathered_rows_kernel<<<update_grid, 128, 0, stream>>>(
+        constexpr unsigned int update_warps = 4;  // one warp per request
+        dim3 update_grid(rows, (static_cast<unsigned int>(sparse_len) + update_warps - 1) / update_warps);
+        cometkv::update_token_cache_from_gathered_rows_kernel<<<update_grid, update_warps * 32, 0, stream>>>(
             request_token_ids.data_ptr<int32_t>(), hit_mask.data_ptr<int32_t>(),
             reinterpret_cast<const uint16_t*>(out_keys.data_ptr()),
             reinterpret_cast<const uint16_t*>(out_values.data_ptr()),
