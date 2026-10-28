@@ -1720,7 +1720,7 @@ class cometkv_cache(KV_Cache):
             # sorted=True would trip torch's k>4096 sort_outf fallback
             # (cub segmented sort + gather + 2 copies, ~185us/layer at 96k budgets).
             if k > 0:
-                use_radix = (self.exact_topk_impl != "torch" and k <= 4096
+                use_radix = (self.exact_topk_impl != "torch" and k <= 10240  # native kSelectMaxK
                              and scores.device == self.selected_indices_buffer.device
                              and (self.exact_topk_impl == "radix"
                                   or (end - start >= 4096 and 4 * k <= end - start)))

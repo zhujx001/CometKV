@@ -195,6 +195,22 @@ void grouped_signature_score_into(
 }
 
 
+// Largest dynamic shared memory one tail-merge block may request on this device (opt-in carve-out
+// minus the kernel's static reductions and a small margin), cached per device.
+template <typename Kernel>
+size_t tail_merge_dynamic_smem_limit(Kernel kernel, int device) {
+    static size_t limits[64] = {};
+    TORCH_CHECK(device >= 0 && device < 64, "unsupported CUDA device index");
+    if (!limits[device]) {
+        int optin = 0;
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        cudaFuncAttributes attributes;
+        C10_CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
+        limits[device] = static_cast<size_t>(optin) - attributes.sharedSizeBytes - 512;
+    }
+    return limits[device];
+}
+
 void sampled_tail_attention_merge(
     torch::Tensor queries,      // [rows, group, dim] bf16
     torch::Tensor tail_keys,    // [rows, m, dim] bf16
@@ -275,16 +291,29 @@ void sampled_tail_attention_merge(
         && reinterpret_cast<uintptr_t>(tail_values.data_ptr()) % alignof(uint2) == 0;
     const size_t value_scratch = vectorized ? vector_scratch : 0;
     TORCH_CHECK(smem <= shared_limit, "sampled tail m too large for shared memory");
+    // Exact head-set membership table. Small head sets keep the <=50% load table in the default
+    // 48 KB; larger ones (k > 4096, e.g. >=6% at 96K) use the opt-in shared-memory carve-out and
+    // up to 75% load instead of degrading to the O(m * head_len) global-memory scan below.
+    const auto kernel = cometkv::sampled_tail_attention_merge_kernel<threads>;
+    const size_t optin_limit = tail_merge_dynamic_smem_limit(kernel, queries.get_device());
     int hash_capacity = 0;
-    if (head_len > 0 && head_len <= 4096) {
+    if (head_len > 0) {
         hash_capacity = 32;
         while (hash_capacity < 2 * head_len) hash_capacity *= 2;
-        if (smem + hash_capacity * sizeof(int32_t) > shared_limit) hash_capacity = 0;
+        const auto fits = [&](size_t limit) { return smem + hash_capacity * sizeof(int32_t) <= limit; };
+        if (!fits(shared_limit)) {
+            while (!fits(optin_limit) && 4 * head_len <= 3 * (hash_capacity / 2)) hash_capacity /= 2;
+            if (!fits(optin_limit)) hash_capacity = 0;
+        }
     }
     smem += std::max(hash_capacity * sizeof(int32_t), value_scratch);
+    if (smem > shared_limit) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            static_cast<int>(smem)));
+    }
     dim3 grid(rows, group);
     auto stream = at::cuda::getCurrentCUDAStream();
-    cometkv::sampled_tail_attention_merge_kernel<threads><<<grid, threads, smem, stream>>>(
+    kernel<<<grid, threads, smem, stream>>>(
         reinterpret_cast<const nv_bfloat16*>(queries.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(tail_keys.data_ptr()),
         reinterpret_cast<const nv_bfloat16*>(tail_values.data_ptr()),
@@ -406,7 +435,7 @@ void exact_topk_indices_into(
     }
     TORCH_CHECK(start >= 0 && start <= end && end <= tokens, "invalid candidate range");
     TORCH_CHECK(indices.dim() == 2 && indices.size(0) == rows, "indices must be [rows, capacity]");
-    TORCH_CHECK(k >= 0 && k <= end - start && k <= indices.size(1) && k <= 4096, "invalid k (max 4096)");
+    TORCH_CHECK(k >= 0 && k <= end - start && k <= indices.size(1) && k <= cometkv::kSelectMaxK, "invalid k (max 10240)");
     const int64_t chunks = (end - start + cometkv::kSelectChunk - 1) / cometkv::kSelectChunk;
     TORCH_CHECK(histogram.dim() == 3 && histogram.size(0) == rows && histogram.size(1) >= chunks
                 && histogram.size(2) == cometkv::kSelectBinsStride,
@@ -434,7 +463,10 @@ void exact_topk_indices_into(
     else if (k <= 512) { COMETKV_REFINE(2); }
     else if (k <= 1024) { COMETKV_REFINE(4); }
     else if (k <= 2048) { COMETKV_REFINE(8); }
-    else { COMETKV_REFINE(16); }
+    else if (k <= 4096) { COMETKV_REFINE(16); }
+    else if (k <= 6144) { COMETKV_REFINE(24); }
+    else if (k <= 8192) { COMETKV_REFINE(32); }
+    else { COMETKV_REFINE(40); }
     #undef COMETKV_REFINE
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

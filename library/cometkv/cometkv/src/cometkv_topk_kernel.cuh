@@ -12,6 +12,7 @@ constexpr int kSelectThreads = 256;
 constexpr int kSelectChunk = 1024;
 constexpr int kSelectBinsStride = 288;  // 256 bins + min/max; keep chunk rows 128B-aligned.
 constexpr int kSelectStateSize = 7;
+constexpr int kSelectMaxK = kSelectThreads * 40;  // widest refine instantiation
 
 __device__ __forceinline__ uint32_t ordered_score(float value) {
     // Match largest=True for finite values/infinities, putting NaNs first.
